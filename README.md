@@ -27,8 +27,7 @@ Activate the virtual environment and install the required dependencies from `req
 - On **Windows**:
 
   ```bash
-  .
-venv\Scripts\Activate.ps1
+  .venv\Scripts\Activate.ps1
   ```
 
 - On **Linux**:
