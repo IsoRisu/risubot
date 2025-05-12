@@ -27,7 +27,8 @@ Activate the virtual environment and install the required dependencies from `req
 - On **Windows**:
 
   ```bash
-  .venv\Scriptsctivate
+  .
+venv\Scripts ctivate
   ```
 
 - On **Linux**:
