@@ -1,3 +1,0 @@
-discord.py
-yt-dlp
-asyncio
