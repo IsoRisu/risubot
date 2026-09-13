@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "risubot"
+version = "0.1.0"
+description = "Discord music bot"
+authors = ["Risu"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+"discord.py" = {version = "^2.4.0", extras = ["voice"]}
+yt-dlp = "*"
+PyNaCl = "^1.5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

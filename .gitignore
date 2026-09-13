@@ -1,3 +1,40 @@
+# --- Secrets ---
 botkey.py
-.venv
+.env
+
+# --- Python ---
 __pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv
+venv/
+env/
+
+# --- Poetry ---
+# Keep poetry.lock committed if you want reproducible installs across
+# machines. Uncomment the next line if you'd rather not track it.
+poetry.lock
+
+# --- yt-dlp / downloaded media (in case anything is ever saved locally) ---
+*.mp3
+*.m4a
+*.webm
+*.opus
+*.part
+*.ytdl
+
+# --- Logs ---
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Editors ---
+.vscode/
+.idea/
+*.swp
