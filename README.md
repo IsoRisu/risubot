@@ -3,52 +3,45 @@
 
 Follow these steps to set up and run the bot:
 
-## 1. Create a `botkey.py` File
-
-Create a new file named `botkey.py` and store your bot's key as a string in the variable `bot_key`:
-
-```python
-# botkey.py
-bot_key = "your-bot-key-here"
-```
-
-## 2. Create a Virtual Environment
-
-Create a virtual environment to isolate your project dependencies:
-
-```bash
-python -m venv venv
-```
-
 ## 3. Install Dependencies
 
-Activate the virtual environment and install the required dependencies from `requirements.txt`:
+Install Poetry (if you don't have it already):
 
-- On **Windows**:
+\`\`\`bash
+pip install poetry
+\`\`\`
 
-  ```bash
-  .\venv\Scripts\activate
-  ```
+Then install the project's dependencies:
 
-- On **Linux**:
+\`\`\`bash
+poetry install
+\`\`\`
 
-  ```bash
-  source venv/bin/activate
-  ```
+If you're picking this project back up after a while, it's worth updating
+dependencies too, since yt-dlp especially needs frequent updates to keep
+working with YouTube:
 
-Then, install the required packages:
+\`\`\`bash
+poetry update
+\`\`\`
 
-```bash
-pip install -r requirements.txt
-```
+## 4. Set Up Your Bot Token
 
-## 4. Run the App
+Create a `botkey.py` file in the project root with:
 
-Once the dependencies are installed, run the bot application:
+\`\`\`python
+bot_key = "YOUR_DISCORD_BOT_TOKEN"
+\`\`\`
 
-```bash
-python risubot.py
-```
+This file is gitignored and won't be included if you clone the repo.
+
+## 5. Run the App
+
+Once dependencies are installed, run the bot:
+
+\`\`\`bash
+poetry run python risubot.py
+\`\`\`
 
 Your bot should now be up and running!
 
