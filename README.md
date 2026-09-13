@@ -3,7 +3,7 @@
 
 Follow these steps to set up and run the bot:
 
-## 3. Install Dependencies
+## 1. Install Dependencies
 
 Install Poetry (if you don't have it already):
 
@@ -25,7 +25,7 @@ working with YouTube:
 poetry update
 \`\`\`
 
-## 4. Set Up Your Bot Token
+## 2. Set Up Your Bot Token
 
 Create a `botkey.py` file in the project root with:
 
@@ -35,7 +35,7 @@ bot_key = "YOUR_DISCORD_BOT_TOKEN"
 
 This file is gitignored and won't be included if you clone the repo.
 
-## 5. Run the App
+## 3. Run the App
 
 Once dependencies are installed, run the bot:
 
