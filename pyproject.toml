@@ -10,6 +10,7 @@ python = "^3.11"
 "discord.py" = {version = "^2.4.0", extras = ["voice"]}
 yt-dlp = "*"
 PyNaCl = "^1.5.0"
+freeflow-llm = "*"
 
 [build-system]
 requires = ["poetry-core"]
