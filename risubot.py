@@ -4,6 +4,7 @@ import yt_dlp
 import asyncio
 import botkey  # Assuming botkey.py contains: bot_key = "YOUR_TOKEN"
 from collections import deque
+import risuai  
 
 # --- Bot Configuration ---
 TOKEN = botkey.bot_key
@@ -322,6 +323,34 @@ async def on_command_error(ctx, error):
         await ctx.send(f"An unexpected error occurred: {error}")
         print(f"Unexpected error: {error}")
 
+@bot.command(name="ask")
+async def ask_command(ctx, *, prompt: str):
+    """Usage: !ask <your question>"""
+
+    # Checks for the server whitelist
+    if ctx.guild is None or ctx.guild.id != botkey.ALLOWED_GUILD_ID:
+        await ctx.reply("This command isn't available here.")
+        return  # Silently ignore in other servers/DMs
+    
+    if not prompt.strip():
+        await ctx.reply("Give me something to work with, e.g. `!ask what is 2+2?`")
+        return
+
+    # Show a typing indicator while we wait on the API
+    async with ctx.typing():
+        try:
+            reply = await asyncio.to_thread(risuai.ask, prompt)
+        except Exception as e:
+            await ctx.reply(f"AI error: `{type(e).__name__}: {e}`")
+            return
+
+    # Discord messages cap at 2000 chars; split if needed
+    for i in range(0, len(reply), 1900):
+        chunk = reply[i:i + 1900]
+        if i == 0:
+            await ctx.reply(chunk)
+        else:
+            await ctx.send(chunk)
 
 # --- Run the Bot ---
 if __name__ == "__main__":
