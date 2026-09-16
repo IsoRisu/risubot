@@ -4,7 +4,7 @@ import yt_dlp
 import asyncio
 import botkey  # Assuming botkey.py contains: bot_key = "YOUR_TOKEN"
 from collections import deque
-import risuai  
+import llmclient  
 
 # --- Bot Configuration ---
 TOKEN = botkey.bot_key
@@ -323,35 +323,80 @@ async def on_command_error(ctx, error):
         await ctx.send(f"An unexpected error occurred: {error}")
         print(f"Unexpected error: {error}")
 
-@bot.command(name="ask")
-async def ask_command(ctx, *, prompt: str):
-    """Usage: !ask <your question>"""
+# Discord's own upload cap is higher, but Gemini's inline-data request
+# limit is ~20 MB total, so leave headroom for base64 overhead (+33%).
+MAX_ATTACHMENT_BYTES = 14 * 1024 * 1024
 
-    # Checks for the server whitelist
+
+async def collect_attachments(message) -> tuple[list, list]:
+    """Pull attachments off a message and, if it's a reply, off the message
+    it replies to. Returns (attachments, skipped_filenames)."""
+    sources = list(message.attachments)
+
+    ref = message.reference
+    if ref is not None:
+        replied = ref.resolved
+        if replied is None and ref.message_id:
+            try:
+                replied = await message.channel.fetch_message(ref.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                replied = None
+        if isinstance(replied, discord.Message):
+            sources.extend(replied.attachments)
+
+    out, skipped, total = [], [], 0
+    for a in sources:
+        ctype = (a.content_type or "").split(";")[0]
+        if not ctype.startswith(llmclient.SUPPORTED_PREFIXES):
+            skipped.append(a.filename)
+            continue
+        if total + a.size > MAX_ATTACHMENT_BYTES:
+            skipped.append(a.filename)
+            continue
+        data = await a.read()
+        out.append(llmclient.Attachment(data, ctype, a.filename))
+        total += a.size
+
+    return out, skipped
+
+
+@bot.command(name="ask")
+async def ask_command(ctx, *, prompt: str = ""):
+    """Usage: !ask <question>, optionally with an image/audio/video/PDF
+    attached, or as a reply to a message that has one."""
+
     if ctx.guild is None or ctx.guild.id != botkey.ALLOWED_GUILD_ID:
         await ctx.reply("This command isn't available here.")
-        return  # Silently ignore in other servers/DMs
-    
-    if not prompt.strip():
-        await ctx.reply("Give me something to work with, e.g. `!ask what is 2+2?`")
         return
 
-    # Show a typing indicator while we wait on the API
     async with ctx.typing():
         try:
-            reply = await asyncio.to_thread(risuai.ask, prompt)
+            attachments, skipped = await collect_attachments(ctx.message)
+        except discord.HTTPException as e:
+            await ctx.reply(f"Couldn't download that attachment: `{e}`")
+            return
+
+        if not prompt.strip() and not attachments:
+            await ctx.reply("Give me something to work with — a question, or an image.")
+            return
+
+        if skipped:
+            await ctx.send(f"Skipping (unsupported or too large): {', '.join(skipped)}")
+
+        try:
+            reply = await asyncio.to_thread(llmclient.ask, prompt, attachments)
         except Exception as e:
             await ctx.reply(f"AI error: `{type(e).__name__}: {e}`")
             return
 
-    # Discord messages cap at 2000 chars; split if needed
+    if not reply:
+        await ctx.reply("(empty response)")
+        return
+
     for i in range(0, len(reply), 1900):
         chunk = reply[i:i + 1900]
-        if i == 0:
-            await ctx.reply(chunk)
-        else:
-            await ctx.send(chunk)
-
+        await (ctx.reply(chunk) if i == 0 else ctx.send(chunk))
+        
 # --- Run the Bot ---
 if __name__ == "__main__":
     if TOKEN == 'YOUR_DISCORD_BOT_TOKEN' or not TOKEN:
