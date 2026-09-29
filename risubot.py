@@ -4,7 +4,13 @@ import yt_dlp
 import asyncio
 import botkey  # Assuming botkey.py contains: bot_key = "YOUR_TOKEN"
 from collections import deque
-import llmclient  
+import llmclient
+import latexrenderer
+import io  # for discord.File
+import mimetypes
+import re
+import shlex
+import traceback
 
 # --- Bot Configuration ---
 TOKEN = botkey.bot_key
@@ -16,7 +22,13 @@ intents.message_content = True
 intents.guilds = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+# Never let model output (or song titles) ping @everyone / roles / users.
+# Only the replied-to author is pinged, as with a normal reply.
+bot = commands.Bot(
+    command_prefix=PREFIX,
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True),
+)
 
 # Per-guild queues: {guild_id: deque([...])}
 # A single global queue breaks as soon as the bot is in more than one server,
@@ -65,7 +77,7 @@ async def get_audio_source(query_or_url):
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             try:
                 return ydl.extract_info(query_or_url, download=False)
-            except yt_dlp.utils.DownloadError as e:
+            except yt_dlp.utils.YoutubeDLError as e:
                 print(f"Error extracting info with yt-dlp: {e}")
                 return None
 
@@ -104,7 +116,7 @@ def build_ffmpeg_opts(http_headers: dict) -> dict:
     header_str = ''.join(f'{k}: {v}\r\n' for k, v in (http_headers or {}).items())
     before_options = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
     if header_str:
-        before_options += f' -headers "{header_str}"'
+        before_options += f' -headers {shlex.quote(header_str)}'
     return {
         'before_options': before_options,
         'options': BASE_FFMPEG_OPTS['options'],
@@ -112,6 +124,20 @@ def build_ffmpeg_opts(http_headers: dict) -> dict:
 
 
 # --- Core Music Playback Logic ---
+def _schedule(coro):
+    """Thread-safe: run a coroutine on the bot loop from the player thread,
+    logging (rather than silently swallowing) any exception it raises."""
+    future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+    def _done(f):
+        try:
+            f.result()
+        except Exception as e:
+            print(f"Scheduled coroutine failed: {type(e).__name__}: {e}")
+
+    future.add_done_callback(_done)
+
+
 async def play_next(ctx_param):
     guild_id = ctx_param.guild.id
     queue = get_queue(guild_id)
@@ -119,7 +145,7 @@ async def play_next(ctx_param):
     if not queue:
         vc = discord.utils.get(bot.voice_clients, guild=ctx_param.guild)
         if vc and vc.is_connected():
-            asyncio.run_coroutine_threadsafe(ctx_param.send("Queue finished."), bot.loop)
+            await ctx_param.send("Queue finished.")
         print(f"Music queue is empty for guild {guild_id}. Playback stopped.")
         return
 
@@ -148,24 +174,17 @@ async def play_next(ctx_param):
         def after_playing_song_callback(error):
             if error:
                 print(f'Player error in guild {guild_id} for song "{song_title}": {error}')
-                asyncio.run_coroutine_threadsafe(
-                    original_ctx.send(f"Playback error for '{song_title}': {error}"),
-                    bot.loop
-                )
-            future = asyncio.run_coroutine_threadsafe(play_next(original_ctx), bot.loop)
-            try:
-                future.result(timeout=5)
-            except asyncio.TimeoutError:
-                print(f"play_next call from after_playing_song_callback (guild {guild_id}) timed out on future.result().")
-            except Exception as e:
-                print(f"Error running/scheduling play_next from after_playing_song_callback (guild {guild_id}): {e}")
+                _schedule(original_ctx.send(f"Playback error for '{song_title}': {error}"))
+            # This runs on discord.py's player thread. Schedule and return;
+            # blocking on the result would stall the thread.
+            _schedule(play_next(original_ctx))
 
         vc.play(source, after=after_playing_song_callback)
         await original_ctx.send(f'Now playing: **{song_title}**')
     except Exception as e:
         await original_ctx.send(f"An error occurred before playing '{song_title}': {e}")
         print(f"Error in play_next setup for '{song_title}' in guild {guild_id}: {e}")
-        asyncio.run_coroutine_threadsafe(play_next(original_ctx), bot.loop)
+        await play_next(original_ctx)
 
 
 # --- Bot Events ---
@@ -177,7 +196,34 @@ async def on_ready():
     print('------')
 
 
+def chunk_text(text: str, limit: int = 1900) -> list:
+    """Split text for Discord's 2000-char cap, preferring line breaks. If a cut
+    lands inside a ``` code fence, close it and reopen it in the next chunk so
+    the formatting doesn't break."""
+    chunks, open_fence = [], None
+    while text:
+        prefix = open_fence + "\n" if open_fence else ""
+        room = limit - len(prefix) - 4  # leave space for a closing "\n```"
+        if len(text) <= room:
+            chunks.append(prefix + text)
+            break
+        cut = text.rfind("\n", 0, room)
+        if cut <= 0:
+            cut = room
+        body, text = prefix + text[:cut], text[cut:].lstrip("\n")
+        state = None
+        for line in body.splitlines():
+            if line.startswith("```"):
+                state = None if state else line.strip()
+        if state:
+            body += "\n```"
+        open_fence = state
+        chunks.append(body)
+    return chunks
+
+
 # --- Bot Commands ---
+@commands.guild_only()
 @bot.command(name='join', help='Tells the bot to join the voice channel you are in.')
 async def join(ctx):
     if not ctx.author.voice:
@@ -192,6 +238,7 @@ async def join(ctx):
     await ctx.send(f"Joined **{channel}**")
 
 
+@commands.guild_only()
 @bot.command(name='leave', aliases=['dc'], help='Tells the bot to leave the voice channel.')
 async def leave(ctx):
     if ctx.voice_client is not None:
@@ -202,6 +249,7 @@ async def leave(ctx):
         await ctx.send("I'm not in a voice channel.")
 
 
+@commands.guild_only()
 @bot.command(name='play', aliases=['p'], help='Plays a song or adds to queue. Usage: !play <URL or search query>')
 async def play(ctx, *, query: str):
     if not ctx.author.voice:
@@ -238,6 +286,7 @@ async def play(ctx, *, query: str):
         await play_next(ctx)
 
 
+@commands.guild_only()
 @bot.command(name='stop', help='Stops the music and clears the queue.')
 async def stop(ctx):
     if ctx.voice_client:
@@ -252,6 +301,7 @@ async def stop(ctx):
         get_queue(ctx.guild.id).clear()
 
 
+@commands.guild_only()
 @bot.command(name='skip', aliases=['s'], help='Skips the current song.')
 async def skip(ctx):
     if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
@@ -261,6 +311,7 @@ async def skip(ctx):
         await ctx.send("Nothing is currently playing to skip.")
 
 
+@commands.guild_only()
 @bot.command(name='pause', help='Pauses the current song.')
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
@@ -272,6 +323,7 @@ async def pause(ctx):
         await ctx.send("Nothing is currently playing to pause.")
 
 
+@commands.guild_only()
 @bot.command(name='resume', help='Resumes the paused song.')
 async def resume(ctx):
     if ctx.voice_client and ctx.voice_client.is_paused():
@@ -283,6 +335,7 @@ async def resume(ctx):
         await ctx.send("Nothing to resume.")
 
 
+@commands.guild_only()
 @bot.command(name='queue', aliases=['q'], help='Displays the current music queue.')
 async def queue_command(ctx):
     queue = get_queue(ctx.guild.id)
@@ -315,7 +368,6 @@ async def on_command_error(ctx, error):
         original_error = getattr(error, 'original', error)
         await ctx.send(f"An error occurred with the `{ctx.command}` command. Please check the console for details.")
         print(f"CommandInvokeError in command {ctx.command}: {original_error}")
-        import traceback
         traceback.print_exception(type(original_error), original_error, original_error.__traceback__)
     elif isinstance(error, commands.CheckFailure):
         await ctx.send(f"You do not have the necessary permissions or conditions to run `{ctx.command}`.")
@@ -347,6 +399,8 @@ async def collect_attachments(message) -> tuple[list, list]:
     out, skipped, total = [], [], 0
     for a in sources:
         ctype = (a.content_type or "").split(";")[0]
+        if not ctype:
+            ctype = mimetypes.guess_type(a.filename)[0] or ""
         if not ctype.startswith(llmclient.SUPPORTED_PREFIXES):
             skipped.append(a.filename)
             continue
@@ -365,7 +419,7 @@ async def ask_command(ctx, *, prompt: str = ""):
     """Usage: !ask <question>, optionally with an image/audio/video/PDF
     attached, or as a reply to a message that has one."""
 
-    if ctx.guild is None or ctx.guild.id != botkey.ALLOWED_GUILD_ID:
+    if ctx.guild is None or ctx.guild.id != getattr(botkey, "ALLOWED_GUILD_ID", None):
         await ctx.reply("This command isn't available here.")
         return
 
@@ -373,7 +427,7 @@ async def ask_command(ctx, *, prompt: str = ""):
         try:
             attachments, skipped = await collect_attachments(ctx.message)
         except discord.HTTPException as e:
-            await ctx.reply(f"Couldn't download that attachment: `{e}`")
+            await ctx.reply(f"Couldn't download that attachment: `{e}`"[:1900])
             return
 
         if not prompt.strip() and not attachments:
@@ -381,22 +435,60 @@ async def ask_command(ctx, *, prompt: str = ""):
             return
 
         if skipped:
-            await ctx.send(f"Skipping (unsupported or too large): {', '.join(skipped)}")
+            await ctx.send(f"Skipping (unsupported or too large): {', '.join(skipped)}"[:1900])
 
         try:
             reply = await asyncio.to_thread(llmclient.ask, prompt, attachments)
         except Exception as e:
-            await ctx.reply(f"AI error: `{type(e).__name__}: {e}`")
+            # Error bodies can be long; Discord rejects messages over 2000 chars.
+            await ctx.reply(f"AI error: `{type(e).__name__}: {e}`"[:1900])
             return
 
-    if not reply:
-        await ctx.reply("(empty response)")
-        return
+        if not reply:
+            await ctx.reply("(empty response)")
+            return
 
-    for i in range(0, len(reply), 1900):
-        chunk = reply[i:i + 1900]
-        await (ctx.reply(chunk) if i == 0 else ctx.send(chunk))
-        
+        # Render off the event loop; matplotlib is CPU-bound and blocking.
+        if latexrenderer.contains_latex(reply):
+            try:
+                segments = await asyncio.to_thread(latexrenderer.split_and_render, reply)
+            except Exception as e:
+                print(f"LaTeX rendering failed: {type(e).__name__}: {e}")
+                segments = [("text", reply)]
+        else:
+            segments = [("text", reply)]
+
+    # Merge consecutive text segments so we don't post a message per word.
+    merged = []
+    for kind, val in segments:
+        if kind == "text" and merged and merged[-1][0] == "text":
+            merged[-1] = ("text", merged[-1][1] + val)
+        else:
+            merged.append((kind, val))
+
+    first_message = True
+
+    async def send(**kwargs):
+        nonlocal first_message
+        if first_message:
+            await ctx.reply(**kwargs)
+            first_message = False
+        else:
+            await ctx.send(**kwargs)
+
+    async def send_text(text: str):
+        # Discord caps messages at 2000 chars; leave headroom.
+        for chunk in chunk_text(text):
+            if chunk.strip():  # Discord rejects empty / whitespace-only messages
+                await send(content=chunk)
+
+    for kind, val in merged:
+        if kind == "text":
+            await send_text(val)
+        else:
+            await send(file=discord.File(io.BytesIO(val), filename="latex.png"))
+
+
 # --- Run the Bot ---
 if __name__ == "__main__":
     if TOKEN == 'YOUR_DISCORD_BOT_TOKEN' or not TOKEN:
