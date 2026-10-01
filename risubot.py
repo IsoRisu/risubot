@@ -6,6 +6,7 @@ import botkey  # Assuming botkey.py contains: bot_key = "YOUR_TOKEN"
 from collections import deque
 import llmclient
 import latexrenderer
+import graphrenderer
 import io  # for discord.File
 import mimetypes
 import re
@@ -369,6 +370,8 @@ async def on_command_error(ctx, error):
         await ctx.send(f"An error occurred with the `{ctx.command}` command. Please check the console for details.")
         print(f"CommandInvokeError in command {ctx.command}: {original_error}")
         traceback.print_exception(type(original_error), original_error, original_error.__traceback__)
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Slow down, try again in {error.retry_after:.0f}s.")
     elif isinstance(error, commands.CheckFailure):
         await ctx.send(f"You do not have the necessary permissions or conditions to run `{ctx.command}`.")
     else:
@@ -482,11 +485,80 @@ async def ask_command(ctx, *, prompt: str = ""):
             if chunk.strip():  # Discord rejects empty / whitespace-only messages
                 await send(content=chunk)
 
+    # Consecutive equations go out together (Discord allows 10 files per message)
+    # instead of one message each. Whitespace between them is dropped.
+    pending = []
+
+    async def flush_images():
+        nonlocal pending
+        for start in range(0, len(pending), 10):
+            files = [
+                discord.File(io.BytesIO(png), filename=f"math_{start + k}.png")
+                for k, png in enumerate(pending[start:start + 10])
+            ]
+            await send(files=files)
+        pending = []
+
     for kind, val in merged:
-        if kind == "text":
+        if kind == "image":
+            pending.append(val)
+        elif val.strip():
+            await flush_images()
             await send_text(val)
-        else:
-            await send(file=discord.File(io.BytesIO(val), filename="latex.png"))
+    await flush_images()
+
+
+PLOT_USAGE = (
+    "Usage: `!plot <function, equation or inequality>[; <next> ...] [from <a> to <b>]`\n"
+    "Functions: `!plot x^2 - 2x + 1`, `!plot sin(x); cos(x) from -6.3 to 6.3`, `!plot ln(x) from 0.1 to 10`\n"
+    "Curves: `!plot x²+y²=1`, `!plot x^2/4 + y^2 = 1`, `!plot x*y = 1`\n"
+    "Regions (shaded; dashed edge for `<` `>`, solid for `<=` `>=`): `!plot x²+y²<1`, `!plot y > x^2`, "
+    "`!plot x + y <= 2; x > 0`\n"
+    "Available: sin cos tan asin acos atan sinh cosh tanh exp sqrt cbrt abs sign floor ceil ln log10 log2, "
+    "constants pi and e, variables `x` and `y`. Up to 6 graphs, separated by `;`. "
+    "The range applies to both axes; leave it out for curves and regions and the view fits automatically."
+)
+
+
+@bot.command(name="plot", aliases=["graph", "kuvaaja"],
+             help="Draws graphs of functions and curves. Usage: !plot sin(x); x^2 from -5 to 5  or  !plot x^2+y^2<1")
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def plot_command(ctx, *, spec: str):
+    async with ctx.typing():
+        try:
+            png = await asyncio.to_thread(latexrenderer.render_plot_spec, spec)
+        except Exception as e:
+            await ctx.reply(f"Couldn't plot that: {e}\n{PLOT_USAGE}"[:1900])
+            return
+    await ctx.reply(file=discord.File(io.BytesIO(png), filename="plot.png"))
+
+
+DIAGRAM_USAGE = (
+    "Usage: `!diagram <description>`. Statements are separated by `;` or new lines.\n"
+    "Graph: `!diagram A -- B; B -- C : 5; C -> A; highlight: A`\n"
+    "DFA/NFA (`!dfa`, `!nfa`): `!dfa start: q0; accept: q1; q0 -0-> q0; q0 -1-> q1; q1 -0,1-> q1`\n"
+    "Turing machine (`!tm`): `!tm start: q0; accept: qa; q0 -1/0,R-> q0; q0 -_/_,L-> qa; tape: 1 1 _; head: 0; state: q0`\n"
+    "Tree (`!tree`): `!tree root -> a; root -> b; a -> c`\n"
+    "Edges: `A -> B` directed, `A -- B` undirected, `A <-> B` both, `: 5` or `-label->` for labels. "
+    "Also `start:`, `accept:`, `nodes:`, `highlight:`, `title:`, `layout: circle|spring|lr|tb|tree`, `tape:`, `head:`, `state:`. "
+    "Write epsilon as `eps`. Up to 30 nodes and 100 edges."
+)
+
+_DIAGRAM_KINDS = {"diagram": "graph", "verkko": "graph", "puu": "tree", "automaatti": "automaton"}
+
+
+@bot.command(name="diagram", aliases=["verkko", "automaton", "automaatti", "dfa", "nfa", "fsm", "tm", "turing", "pda", "tree", "puu"],
+             help="Draws graphs, automata, Turing machines and trees. Usage: !dfa start: q0; accept: q1; q0 -a-> q1  (see !diagram for the full syntax)")
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def diagram_command(ctx, *, spec: str):
+    kind = _DIAGRAM_KINDS.get(ctx.invoked_with.lower(), ctx.invoked_with.lower())
+    async with ctx.typing():
+        try:
+            png = await asyncio.to_thread(graphrenderer.render_graph_spec, spec, kind)
+        except Exception as e:
+            await ctx.reply(f"Couldn't draw that: {e}\n{DIAGRAM_USAGE}"[:1900])
+            return
+    await ctx.reply(file=discord.File(io.BytesIO(png), filename="diagram.png"))
 
 
 # --- Run the Bot ---
