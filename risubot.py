@@ -12,6 +12,14 @@ import mimetypes
 import re
 import shlex
 import traceback
+import os
+import sys
+import json
+import threading
+import requests
+# SPOTIFY FUNCTIONALITY
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
 
 # --- Bot Configuration ---
 TOKEN = botkey.bot_key
@@ -167,6 +175,30 @@ async def play_next(ctx_param):
         print(f"play_next called for '{song_title}' while VC is already playing/paused. Re-queueing song.")
         queue.appendleft(song_item)
         return
+
+    # Lazily-resolved entries (e.g. from !spotify) only carry a search query;
+    # look up the YouTube stream now so the URL is fresh.
+    if not song_url:
+        try:
+            song_url, resolved_title, song_headers = await get_audio_source(song_item['query'])
+        except Exception as e:
+            print(f"Lazy lookup failed for '{song_item['query']}': {e}")
+            song_url = None
+        if not song_url:
+            await original_ctx.send(f"Couldn't find a YouTube match for **{song_item['title']}**, skipping.")
+            await play_next(original_ctx)
+            return
+        song_title = resolved_title or song_title
+        song_headers = song_headers or {}
+        # The lookup awaited, so something else may have started playback or the bot may have left.
+        vc = discord.utils.get(bot.voice_clients, guild=original_ctx.guild)
+        if not vc or not vc.is_connected():
+            queue.clear()
+            return
+        if vc.is_playing() or vc.is_paused():
+            song_item.update(url=song_url, title=song_title, headers=song_headers)
+            queue.appendleft(song_item)
+            return
 
     try:
         ffmpeg_opts = build_ffmpeg_opts(song_headers)
@@ -560,9 +592,291 @@ async def diagram_command(ctx, *, spec: str):
             return
     await ctx.reply(file=discord.File(io.BytesIO(png), filename="diagram.png"))
 
+# --- Spotify Setup ---
+# Spotify's Feb 2026 Web API changes (Development Mode apps) matter here:
+#   * playlist contents are only returned for playlists the *logged-in* account owns or collaborates on
+#   * GET /playlists/{id}/tracks was renamed to /items and track -> item in responses
+#   * GET /artists/{id}/top-tracks was removed
+#   * search limit max is 10
+SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spotify_token_cache")
+MAX_SPOTIFY_TRACKS = 300          # safety cap so one link can't flood the queue
+# If Spotify's API refuses a playlist, try the public embed page as a last resort
+# (public playlists only, ~100 tracks max, unofficial, may break at any time).
+SPOTIFY_EMBED_FALLBACK = True
+
+_spotify_client = None
+_spotify_lock = threading.Lock()   # get_spotify_client() runs in worker threads, so a threading lock, not asyncio
+
+
+def _make_spotify_auth(open_browser: bool = False):
+    cid = getattr(botkey, "spotify_client_id", None)
+    secret = getattr(botkey, "spotify_client_secret", None)
+    redirect_uri = getattr(botkey, "spotify_redirect_uri", "http://127.0.0.1:8888/callback")
+    if not cid or not secret:
+        return None
+    return SpotifyOAuth(
+        client_id=cid,
+        client_secret=secret,
+        redirect_uri=redirect_uri,
+        scope=SPOTIFY_SCOPE,
+        cache_path=SPOTIFY_CACHE_PATH,   # absolute path: doesn't depend on the working directory
+        open_browser=open_browser,
+    )
+
+
+def get_spotify_client():
+    """Return a cached Spotify client, or None if credentials are missing.
+    Never starts an interactive login (that would hang the bot inside a worker
+    thread); raises RuntimeError telling you to run the one-time login instead."""
+    global _spotify_client
+    with _spotify_lock:
+        if _spotify_client is not None:
+            return _spotify_client
+
+        auth = _make_spotify_auth()
+        if auth is None:
+            return None
+
+        # validate_token() refreshes expired tokens and returns None when there is no
+        # token or the cached one was issued with different scopes.
+        if not auth.validate_token(auth.cache_handler.get_cached_token()):
+            raise RuntimeError(
+                "Spotify isn't authorized yet. Stop the bot and run "
+                "`python risubot.py --spotify-auth` once, log in with the Spotify account "
+                "that owns/collaborates on the playlists, then start the bot again."
+            )
+
+        _spotify_client = spotipy.Spotify(auth_manager=auth, requests_timeout=10, retries=3)
+        return _spotify_client
+
+
+def run_spotify_auth():
+    """One-time interactive login (python risubot.py --spotify-auth)."""
+    auth = _make_spotify_auth(open_browser=True)
+    if auth is None:
+        print("Add spotify_client_id and spotify_client_secret to botkey.py first.")
+        return
+    sp = spotipy.Spotify(auth_manager=auth, requests_timeout=10)
+    me = sp.current_user()
+    print(f"Authorized as: {me.get('display_name') or me['id']} (id: {me['id']})")
+    print(f"Token cached at {SPOTIFY_CACHE_PATH}")
+
+
+SPOTIFY_URL_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?(?:user/[^/\s]+/)?|spotify:)"
+    r"(playlist|album|track|artist)[/:]([A-Za-z0-9]+)"
+)
+
+
+def parse_spotify_url(url: str):
+    """Return (kind, id) or (None, None). Accepts web links and spotify: URIs."""
+    m = SPOTIFY_URL_RE.search(url)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def _track_to_query(t: dict) -> str:
+    name = t.get("name", "")
+    artists = ", ".join(a["name"] for a in (t.get("artists") or []) if a.get("name"))
+    return f"{artists} - {name}".strip(" -")
+
+
+def _fetch_playlist_via_embed(playlist_id: str) -> list[str]:
+    """Best-effort, unofficial: read the track list from the public embed page."""
+    try:
+        r = requests.get(
+            f"https://open.spotify.com/embed/playlist/{playlist_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text, re.S)
+        if not m:
+            return []
+        entity = json.loads(m.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+        out = []
+        for t in entity.get("trackList", []):
+            title = (t.get("title") or "").strip()
+            artist = (t.get("subtitle") or "").replace("\xa0", " ").strip()
+            if title:
+                out.append(f"{artist} - {title}".strip(" -"))
+        return out
+    except Exception as e:
+        print(f"[spotify] embed fallback failed: {type(e).__name__}: {e}")
+        return []
+
+
+def _fetch_playlist_tracks(sp, playlist_id: str) -> list[str]:
+    tracks = []
+    try:
+        # Raw call: older spotipy versions' playlist_items() still hit the removed
+        # /tracks endpoint, so go to /items directly.
+        results = sp._get(f"playlists/{playlist_id}/items", limit=100, additional_types="track")
+        while results:
+            for entry in results.get("items", []):
+                t = entry.get("item") or entry.get("track")   # 'item' since Feb 2026
+                if not t or not t.get("name") or t.get("type") == "episode":
+                    continue
+                tracks.append(_track_to_query(t))
+            results = sp.next(results) if results.get("next") else None
+        return tracks
+    except spotipy.SpotifyException as e:
+        if e.http_status not in (403, 404):
+            raise
+
+    # 403/404: Spotify won't hand this playlist's contents to the logged-in account.
+    if SPOTIFY_EMBED_FALLBACK:
+        tracks = _fetch_playlist_via_embed(playlist_id)
+        if tracks:
+            return tracks
+
+    try:
+        me = sp.current_user()
+        who = f"**{me.get('display_name') or me['id']}** (`{me['id']}`)"
+    except Exception:
+        who = "an unknown account"
+    raise RuntimeError(
+        "Spotify refused to return this playlist's tracks (403/404). The bot is logged in as "
+        f"{who}. Spotify only returns tracks for playlists the *logged-in* account owns or "
+        "collaborates on, so check that:\n"
+        "• that exact account accepted the collaborator invite (if it's a different account "
+        "from your personal one, re-run `python risubot.py --spotify-auth` with the right one),\n"
+        "• that account is listed under User Management in your Spotify developer dashboard "
+        "(Development Mode apps only work for allow-listed users),\n"
+        "• the app owner's Spotify Premium is active.\n"
+        "Public playlists you don't collaborate on can't be read through the API."
+    )
+
+
+def _fetch_spotify_tracks(kind: str, spotify_id: str) -> list[str]:
+    """Blocking call — run in a thread. Returns ['Artist - Title', ...]."""
+    sp = get_spotify_client()
+    if sp is None:
+        raise RuntimeError(
+            "Spotify credentials missing. Add spotify_client_id and "
+            "spotify_client_secret to botkey.py"
+        )
+
+    tracks = []
+
+    if kind == "track":
+        t = sp.track(spotify_id)
+        if t:
+            tracks.append(_track_to_query(t))
+
+    elif kind == "album":
+        results = sp.album_tracks(spotify_id, limit=50)
+        while results:
+            tracks.extend(_track_to_query(t) for t in results.get("items", []) if t)
+            results = sp.next(results) if results.get("next") else None
+
+    elif kind == "playlist":
+        tracks = _fetch_playlist_tracks(sp, spotify_id)
+
+    elif kind == "artist":
+        # artist_top_tracks was removed in Feb 2026. Approximate with a track search
+        # (max 10 results), keeping only tracks that actually credit this artist.
+        artist = sp.artist(spotify_id)
+        name = artist["name"]
+        try:
+            res = sp.search(q=f'artist:"{name}"', type="track", limit=10)
+            for t in res.get("tracks", {}).get("items", []):
+                if any(a.get("id") == spotify_id for a in t.get("artists", [])):
+                    tracks.append(_track_to_query(t))
+        except spotipy.SpotifyException as e:
+            print(f"[spotify] artist search failed: {e}")
+        if not tracks:
+            tracks.append(name)   # at least let YouTube pick something
+
+    else:
+        raise ValueError(f"Unsupported Spotify link type: {kind}")
+
+    # De-duplicate (keep order) and cap
+    seen, unique = set(), []
+    for q in tracks:
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            unique.append(q)
+    return unique[:MAX_SPOTIFY_TRACKS]
+
+
+@commands.guild_only()
+@bot.command(
+    name="spotify",
+    aliases=["sp"],
+    help="Queues a Spotify playlist/album/track/artist by searching YouTube. "
+         "Usage: !spotify <spotify URL>",
+)
+async def spotify_command(ctx, *, url: str = ""):
+    if not ctx.author.voice:
+        await ctx.send("You need to be in a voice channel to play music.")
+        return
+
+    kind, spotify_id = parse_spotify_url(url.strip())
+    if not kind:
+        await ctx.send(
+            "That doesn't look like a Spotify link. "
+            "Paste a playlist, album, track, or artist URL from open.spotify.com."
+        )
+        return
+
+    # Resolve the Spotify track list first (blocking → thread), so we don't
+    # join voice for a link that turns out to be unreadable.
+    async with ctx.typing():
+        try:
+            track_queries = await asyncio.to_thread(_fetch_spotify_tracks, kind, spotify_id)
+        except spotipy.SpotifyException as e:
+            await ctx.send(f"Spotify error (HTTP {e.http_status}): {e.msg}"[:1900])
+            return
+        except Exception as e:
+            await ctx.send(f"Spotify error: {e}"[:1900])
+            return
+
+    if not track_queries:
+        await ctx.send("No playable tracks found in that Spotify link.")
+        return
+
+    # Ensure the bot is in the caller's voice channel
+    channel = ctx.author.voice.channel if ctx.author.voice else None
+    if channel is None:
+        await ctx.send("You left the voice channel — cancelling.")
+        return
+    vc = ctx.voice_client
+    if vc is None:
+        try:
+            vc = await channel.connect()
+            await ctx.send(f"Joined **{channel}**")
+        except Exception as e:
+            await ctx.send(f"Failed to join your voice channel: {e}")
+            return
+    elif vc.channel != channel:
+        await ctx.send(
+            f"You need to be in the same voice channel as me. I am in **{vc.channel}**."
+        )
+        return
+
+    # Queue lazily: each entry stores only the search query. The YouTube lookup
+    # happens in play_next() right before the song plays. That means playback starts
+    # immediately, and stream URLs (which expire after a few hours) are never stale.
+    queue = get_queue(ctx.guild.id)
+    for query in track_queries:
+        queue.append({"url": None, "query": query, "title": query, "headers": {}, "ctx": ctx})
+
+    capped = " (capped)" if len(track_queries) >= MAX_SPOTIFY_TRACKS else ""
+    await ctx.send(f"Queued **{len(track_queries)}** track(s) from Spotify{capped}.")
+
+    current_vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if current_vc and current_vc.is_connected() and not current_vc.is_playing() and not current_vc.is_paused():
+        await play_next(ctx)
+
 
 # --- Run the Bot ---
 if __name__ == "__main__":
+    if "--spotify-auth" in sys.argv:
+        run_spotify_auth()
+        sys.exit(0)
     if TOKEN == 'YOUR_DISCORD_BOT_TOKEN' or not TOKEN:
         print("ERROR: Please replace 'YOUR_DISCORD_BOT_TOKEN' with your actual bot token in the script or botkey.py.")
     else:
@@ -572,3 +886,4 @@ if __name__ == "__main__":
             print("ERROR: Failed to log in. Make sure your bot token is correct and valid.")
         except Exception as e:
             print(f"An error occurred while trying to run the bot: {e}")
+
