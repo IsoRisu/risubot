@@ -12,6 +12,7 @@ yt-dlp = "*"
 PyNaCl = "^1.5.0"
 freeflow-llm = "*"
 matplotlib = "^3.8"
+spotipy = "*"
 
 [build-system]
 requires = ["poetry-core"]
