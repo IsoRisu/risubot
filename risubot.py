@@ -12,6 +12,7 @@ import mimetypes
 import re
 import shlex
 import traceback
+from random import shuffle # Used for shuffle
 
 # --- Bot Configuration ---
 TOKEN = botkey.bot_key
@@ -35,11 +36,17 @@ bot = commands.Bot(
 # A single global queue breaks as soon as the bot is in more than one server,
 # since songs from different guilds would interleave and play in the wrong place.
 music_queues: dict[int, deque] = {}
+shuffle_flags: dict[int, bool] = {}
 
 def get_queue(guild_id: int) -> deque:
     if guild_id not in music_queues:
         music_queues[guild_id] = deque()
     return music_queues[guild_id]
+
+def shuffle_queue(guild_id: int) -> deque:
+    if guild_id in music_queues:
+        shuffle(music_queues[guild_id])
+    return get_queue(guild_id)
 
 # --- YouTube-DL Options ---
 YDL_OPTS = {
@@ -196,6 +203,17 @@ async def on_ready():
     print('Bot is ready to play music!')
     print('------')
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+  # Check if the bot was in a voice channel before the update
+  if before.channel is not None:
+    voice_client = member.guild.voice_client
+    if voice_client is not None and voice_client.channel == before.channel:
+      # Count human/bot members left in the channel (excluding the bot itself)
+      members_in_channel = len(before.channel.members)
+      if members_in_channel == 1:  # Only the bot is left
+        await voice_client.disconnect()
+
 
 def chunk_text(text: str, limit: int = 1900) -> list:
     """Split text for Discord's 2000-char cap, preferring line breaks. If a cut
@@ -337,14 +355,29 @@ async def resume(ctx):
 
 
 @commands.guild_only()
-@bot.command(name='queue', aliases=['q'], help='Displays the current music queue.')
-async def queue_command(ctx):
+@bot.command(name='queue', aliases=['q'], help='Displays the current music queue. Use -s to shuffle.')
+async def queue_command(ctx, flag: str = None):
     queue = get_queue(ctx.guild.id)
+
+    # Handle shuffle flag: "q -s" or "q shuffle"
+    if flag and flag.lower() in ('-s', 'shuffle', '--shuffle'):
+        if len(queue) <= 1:
+            await ctx.send("Not enough songs in the queue to shuffle.")
+            return
+        shuffle_queue(ctx.guild.id)
+        await ctx.send(f"🔀 Shuffled **{len(queue)}** songs in the queue.")
+
     if not queue:
         await ctx.send("The music queue is empty.")
         return
 
-    lines = ["**🎶 Current Music Queue:**"]
+    # Shuffle indicator in the header
+    is_shuffled = shuffle_flags.get(ctx.guild.id, False)
+    header = "**🎶 Current Music Queue:**"
+    if is_shuffled:
+        header += " 🔀 *(shuffled)*"
+
+    lines = [header]
     for i, song in enumerate(list(queue)):
         if i >= 15:
             lines.append(f"... and {len(queue) - i} more.")
