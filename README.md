@@ -10,6 +10,11 @@ Install Poetry (if you don't have it already):
 pip install poetry
 ```
 
+Create the lock file
+```bash
+poetry lock
+```
+
 Then install the project's dependencies:
 
 ```bash
