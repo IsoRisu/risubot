@@ -56,7 +56,11 @@ Notes:
 - This file is gitignored and won't be included if you clone the repo,
   so every fresh clone needs its own copy.
 
-## 3. Run the App
+## 3. Spotify setup
+Add spotify_client_id and spotify_client_secret to botkey.py. 
+Then you need to authenticate the spotify.
+
+## 4. Run the App
 
 Once dependencies are installed, run the bot:
 
