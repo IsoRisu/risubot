@@ -135,14 +135,23 @@ class Attachment:
         }
 
 
-def _gemini_call(prompt: str, attachments: list, model: str) -> str:
+def build_system_prompt(guild_context: str = None) -> str:
+    """The base system prompt, plus optional per-guild context (e.g. recent chat
+    history of that server). Nothing global is ever modified, so different
+    guilds can't leak into each other."""
+    if guild_context:
+        return SYSTEM_PROMPT + "\n\n" + guild_context
+    return SYSTEM_PROMPT
+
+
+def _gemini_call(prompt: str, attachments: list, model: str, system_prompt: str = None) -> str:
     """One model, with a short retry on transient errors."""
     parts = [a.to_part() for a in attachments]
     if prompt:
         parts.append({"text": prompt})
 
     body = json.dumps({
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": parts}],
     }).encode("utf-8")
 
@@ -186,26 +195,30 @@ def _gemini_call(prompt: str, attachments: list, model: str) -> str:
     return text
 
 
-def _gemini_generate(prompt: str, attachments: list) -> str:
+def _gemini_generate(prompt: str, attachments: list, system_prompt: str = None) -> str:
     """Walk MODEL_CHAIN until one model answers."""
     errors = []
     for model in MODEL_CHAIN:
         try:
-            return _gemini_call(prompt, attachments, model)
+            return _gemini_call(prompt, attachments, model, system_prompt)
         except GeminiUnavailable as e:
             errors.append(str(e))
     raise GeminiUnavailable("All Gemini models unavailable: " + " | ".join(errors))
 
 
-def ask(prompt: str, attachments=None) -> str:
+def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     """
     Send a prompt, optionally with attachments (list of Attachment), and
     return the reply as a string.
 
     Tries each model in MODEL_CHAIN; text-only prompts fall back to FreeFlow
     as a last resort. Attachments never go through FreeFlow.
+
+    guild_context (optional) is extra text appended to the system prompt for
+    this one call, used by the bot to give each Discord server its own memory.
     """
     attachments = attachments or []
+    system_prompt = build_system_prompt(guild_context)
 
     for a in attachments:
         if not a.mime_type.startswith(SUPPORTED_PREFIXES):
@@ -213,19 +226,19 @@ def ask(prompt: str, attachments=None) -> str:
 
     if attachments:
         # Only Gemini can take these; FreeFlow's other providers are text-only.
-        return _gemini_generate(prompt, attachments)
+        return _gemini_generate(prompt, attachments, system_prompt)
 
     # Text only: direct Gemini with model fallback first, because FreeFlow
     # with just a Gemini key has nothing to fall back to. If Gemini is down
     # entirely, FreeFlow gets a turn (useful if you add Groq/etc. keys).
     try:
-        return _gemini_generate(prompt, [])
+        return _gemini_generate(prompt, [], system_prompt)
     except GeminiUnavailable as gemini_err:
         try:
             with FreeFlowClient() as client:
                 response = client.chat(
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt},
                     ],
                     model=TEXT_MODEL,
