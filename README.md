@@ -46,6 +46,10 @@ GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 # Right-click your server in Discord (with Developer Mode enabled)
 # and choose "Copy Server ID".
 ALLOWED_GUILD_ID = 123456789012345678
+
+spotify_client_id =
+spotify_client_secret = 
+
 ```
 
 Notes:
@@ -55,10 +59,13 @@ Notes:
 - `ALLOWED_GUILD_ID` must be an `int`, not a string.
 - This file is gitignored and won't be included if you clone the repo,
   so every fresh clone needs its own copy.
+- To use spotify functionality you need to authenticate first
 
 ## 3. Spotify setup
 Add spotify_client_id and spotify_client_secret to botkey.py. 
 Then you need to authenticate the spotify.
+To authenticate your spotify you need to run.
+python risubot.py --spotify-auth
 
 ## 4. Run the App
 
