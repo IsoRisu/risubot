@@ -1,3 +1,4 @@
+
 # --- Secrets ---
 botkey.py
 .env
@@ -38,3 +39,33 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# --- Spotify token cache ---
+.cache
+.cache/
+.cache-*
+.token-cache
+token_cache
+token_cache.json
+spotify_token_cache.json
+.spotipy-cache
+spotipy_cache
+spotify_cache.json
+
+# --- Chat logs and conversation data ---
+chatlogs.json
+chatlogs*.json
+chat_logs.json
+chat_logs*.json
+chatlogs/
+chat_logs/
+
+# --- Runtime data and local databases ---
+*.sqlite
+*.sqlite3
+*.db
+
+# --- Temporary files ---
+*.tmp
+*.bak
+*.old
