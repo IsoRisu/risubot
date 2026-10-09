@@ -906,6 +906,61 @@ async def spotify_command(ctx, *, url: str = ""):
         await play_next(ctx)
 
 
+# --- Play a specific song from the queue ---
+def find_in_queue(queue: deque, search: str):
+    """Return the index of the first queued song whose title (or search query,
+    for lazily-resolved Spotify entries) contains every word of `search`,
+    case-insensitively. Returns None if nothing matches."""
+    words = search.lower().split()
+    if not words:
+        return None
+    for i, song in enumerate(queue):
+        haystack = f"{song.get('title') or ''} {song.get('query') or ''}".lower()
+        if all(w in haystack for w in words):
+            return i
+    return None
+
+
+@commands.guild_only()
+@bot.command(
+    name='playnow',
+    aliases=['pn', 'jump'],
+    help='Plays a song from the queue right now if it matches your search, keeping the rest of the queue intact. '
+         'Usage: !playnow <part of the song title>',
+)
+async def playnow(ctx, *, search: str):
+    vc = ctx.voice_client
+    if vc is None or not vc.is_connected():
+        await ctx.send("I'm not in a voice channel.")
+        return
+    if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+        await ctx.send(f"You need to be in the same voice channel as me. I am in **{vc.channel}**.")
+        return
+
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The music queue is empty.")
+        return
+
+    index = find_in_queue(queue, search)
+    if index is None:
+        await ctx.send(f"No song in the queue matches '{search}'.")
+        return
+
+    # Pull the match out of the queue (the rest keeps its order) and put it at the front.
+    song_item = queue[index]
+    del queue[index]
+    queue.appendleft(song_item)
+
+    if vc.is_playing() or vc.is_paused():
+        # Stopping triggers the normal "after" callback, which calls play_next()
+        # and pops our song from the front of the queue.
+        await ctx.send(f"Jumping to **{song_item['title']}**...")
+        vc.stop()
+    else:
+        await play_next(ctx)
+
+
 # --- Run the Bot ---
 if __name__ == "__main__":
     if "--spotify-auth" in sys.argv:
