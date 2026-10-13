@@ -12,6 +12,7 @@ import base64
 import json
 import mimetypes
 import os
+import random
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,11 @@ MODEL_CHAIN = [
 ]
 TEXT_MODEL = MODEL_CHAIN[0]  # used for FreeFlow's last-resort attempt
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# Soft guard against pathologically long callers. Gemini Flash accepts far more
+# than this, but an unbounded prompt from a caller like the profiler eventually
+# blows past HTTP body limits after base64 overhead, with a confusing 4xx.
+MAX_PROMPT_CHARS = 200_000
 
 # Tells the model it is talking through Discord and exactly how math is shown.
 # Keep this in sync with latexrenderer.py: the "supported" list below is what
@@ -146,14 +152,18 @@ def build_system_prompt(guild_context: str = None) -> str:
 
 def _gemini_call(prompt: str, attachments: list, model: str, system_prompt: str = None) -> str:
     """One model, with a short retry on transient errors."""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        prompt = prompt[:MAX_PROMPT_CHARS] + "\n[truncated]"
+
     parts = [a.to_part() for a in attachments]
     if prompt:
         parts.append({"text": prompt})
 
-    body = json.dumps({
+    request = {
         "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": parts}],
-    }).encode("utf-8")
+    }
+    body = json.dumps(request).encode("utf-8")
 
     def make_request():
         return urllib.request.Request(
@@ -174,11 +184,14 @@ def _gemini_call(prompt: str, attachments: list, model: str, system_prompt: str 
             text = e.read().decode("utf-8", "replace")[:300]
             last_err = f"HTTP {e.code}: {text}"
             if e.code not in SKIP_MODEL_STATUSES:
-                raise RuntimeError(f"Gemini {model} {last_err}") from None  # e.g. bad key / bad request
+                # Bad key, malformed request, etc. — retrying won't help.
+                raise RuntimeError(f"Gemini {model} {last_err}") from None
         except (urllib.error.URLError, TimeoutError) as e:
             last_err = f"network: {e}"
         if attempt < ATTEMPTS_PER_MODEL:
-            time.sleep(1.5 * attempt)
+            # Jitter so two bots that were throttled at the same instant don't
+            # retry at the same instant and collide again.
+            time.sleep(random.uniform(0.7, 1.3) * 1.5 * attempt)
     else:
         raise GeminiUnavailable(f"{model}: {last_err}")
 
@@ -196,13 +209,22 @@ def _gemini_call(prompt: str, attachments: list, model: str, system_prompt: str 
 
 
 def _gemini_generate(prompt: str, attachments: list, system_prompt: str = None) -> str:
-    """Walk MODEL_CHAIN until one model answers."""
+    """Walk MODEL_CHAIN until one model answers.
+
+    On a fully-transient first pass (every model raised GeminiUnavailable), sleep
+    briefly and try the chain once more. A bad API key raises RuntimeError from
+    _gemini_call and propagates straight out, so this never masks a permanent
+    failure as a retryable one.
+    """
     errors = []
-    for model in MODEL_CHAIN:
-        try:
-            return _gemini_call(prompt, attachments, model, system_prompt)
-        except GeminiUnavailable as e:
-            errors.append(str(e))
+    for pass_no in range(2):
+        for model in MODEL_CHAIN:
+            try:
+                return _gemini_call(prompt, attachments, model, system_prompt)
+            except GeminiUnavailable as e:
+                errors.append(f"pass{pass_no}/{model}: {e}")
+        if pass_no == 0:
+            time.sleep(random.uniform(1.5, 3.0))
     raise GeminiUnavailable("All Gemini models unavailable: " + " | ".join(errors))
 
 
@@ -290,4 +312,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

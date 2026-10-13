@@ -1,4 +1,3 @@
-
 # --- Secrets ---
 botkey.py
 .env
@@ -9,16 +8,22 @@ __pycache__/
 *$py.class
 *.egg-info/
 .eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # --- Virtual environments ---
-.venv
+.venv/
 venv/
 env/
+ENV/
 
 # --- Poetry ---
 # Keep poetry.lock committed if you want reproducible installs across
 # machines. Uncomment the next line if you'd rather not track it.
-poetry.lock
+# poetry.lock
 
 # --- yt-dlp / downloaded media (in case anything is ever saved locally) ---
 *.mp3
@@ -34,11 +39,14 @@ poetry.lock
 # --- OS junk ---
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # --- Editors ---
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
 # --- Spotify token cache ---
 .cache
@@ -49,10 +57,12 @@ token_cache
 token_cache.json
 spotify_token_cache.json
 .spotipy-cache
+.spotify_token_cache
 spotipy_cache
 spotify_cache.json
 
 # --- Chat logs and conversation data ---
+guild_chatlogs.json
 chatlogs.json
 chatlogs*.json
 chat_logs.json
@@ -61,6 +71,16 @@ chatlogs/
 chat_logs/
 
 # --- Runtime data and local databases ---
+# Profiler: ChromaDB directory + the JSON sidecar files it writes next to it
+# (optout list and per-guild server snapshots). All are per-install data.
+profiler_db/
+profiler_db.optout.json
+profiler_db.snapshots.json
+# Any other Chroma directory if PROFILER_DB_PATH is changed to something else
+chroma/
+chroma.sqlite3
+
+# Generic local databases
 *.sqlite
 *.sqlite3
 *.db

@@ -7,6 +7,7 @@ from collections import deque
 import llmclient
 import latexrenderer
 import graphrenderer
+import profiler  # server-wide profiles and insights (!profile ...)
 import io  # for discord.File
 import mimetypes
 import re
@@ -55,6 +56,7 @@ def get_queue(guild_id: int) -> deque:
 def shuffle_queue(guild_id: int) -> deque:
     if guild_id in music_queues:
         shuffle(music_queues[guild_id])
+        shuffle_flags[guild_id] = True      # read by !queue to show the (shuffled) marker
     return get_queue(guild_id)
 
 # --- YouTube-DL Options ---
@@ -160,6 +162,7 @@ async def play_next(ctx_param):
     queue = get_queue(guild_id)
 
     if not queue:
+        shuffle_flags.pop(guild_id, None)   # nothing left to be "shuffled"
         vc = discord.utils.get(bot.voice_clients, guild=ctx_param.guild)
         if vc and vc.is_connected():
             await ctx_param.send("Queue finished.")
@@ -238,14 +241,19 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-  # Check if the bot was in a voice channel before the update
-  if before.channel is not None:
+    """Leave when the last HUMAN leaves the bot's voice channel."""
+    if member.id == bot.user.id:
+        return                                   # the bot's own moves/disconnects
+    if before.channel is None or before.channel == after.channel:
+        return                                   # joins, and mute/deafen/stream changes
     voice_client = member.guild.voice_client
-    if voice_client is not None and voice_client.channel == before.channel:
-      # Count human/bot members left in the channel (excluding the bot itself)
-      members_in_channel = len(before.channel.members)
-      if members_in_channel == 1:  # Only the bot is left
-        await voice_client.disconnect()
+    if voice_client is None or voice_client.channel != before.channel:
+        return                                   # someone left a channel the bot isn't in
+    if any(not m.bot for m in before.channel.members):
+        return                                   # humans remain (other bots don't count)
+    get_queue(member.guild.id).clear()
+    shuffle_flags.pop(member.guild.id, None)
+    await voice_client.disconnect()
 
 
 def chunk_text(text: str, limit: int = 1900) -> list:
@@ -295,6 +303,7 @@ async def join(ctx):
 async def leave(ctx):
     if ctx.voice_client is not None:
         get_queue(ctx.guild.id).clear()
+        shuffle_flags.pop(ctx.guild.id, None)
         await ctx.voice_client.disconnect()
         await ctx.send("Left the voice channel and cleared the queue.")
     else:
@@ -341,6 +350,7 @@ async def play(ctx, *, query: str):
 @commands.guild_only()
 @bot.command(name='stop', help='Stops the music and clears the queue.')
 async def stop(ctx):
+    shuffle_flags.pop(ctx.guild.id, None)
     if ctx.voice_client:
         get_queue(ctx.guild.id).clear()
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
@@ -509,6 +519,10 @@ async def ask_command(ctx, *, prompt: str = ""):
 
         try:
             guild_context = build_guild_context(ctx.guild.id)
+            # Member profile (if any) + short server summary from the last !profile buildall; never raises.
+            profile_context = await profiler.context_for(ctx.guild.id, ctx.author.id)
+            if profile_context:
+                guild_context = (guild_context + "\n\n" if guild_context else "") + profile_context
             reply = await asyncio.to_thread(llmclient.ask, prompt, attachments, guild_context)
         except Exception as e:
             # Error bodies can be long; Discord rejects messages over 2000 chars.
@@ -519,7 +533,7 @@ async def ask_command(ctx, *, prompt: str = ""):
             await ctx.reply("(empty response)")
             return
 
-        remember_exchange(ctx.guild.id, ctx.author.display_name, prompt, reply, [a.name for a in attachments])
+        await remember_exchange(ctx.guild.id, ctx.author.display_name, prompt, reply, [a.name for a in attachments])
 
         # Render off the event loop; matplotlib is CPU-bound and blocking.
         if latexrenderer.contains_latex(reply):
@@ -993,14 +1007,30 @@ def _load_guild_logs() -> dict:
 guild_chatlogs: dict = _load_guild_logs()
 
 
-def _save_guild_logs():
-    try:
-        tmp = GUILD_LOG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(guild_chatlogs, f, ensure_ascii=False)
-        os.replace(tmp, GUILD_LOG_PATH)   # atomic: a crash can't leave a half-written file
-    except Exception as e:
-        print(f"[ai-memory] could not save {GUILD_LOG_PATH}: {type(e).__name__}: {e}")
+_guild_log_write_lock = threading.Lock()
+
+
+def _write_guild_logs(payload: str):
+    """Blocking file write; runs in a worker thread."""
+    with _guild_log_write_lock:
+        try:
+            tmp = GUILD_LOG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, GUILD_LOG_PATH)   # atomic: a crash can't leave a half-written file
+        except Exception as e:
+            print(f"[ai-memory] could not save {GUILD_LOG_PATH}: {type(e).__name__}: {e}")
+
+
+async def _save_guild_logs():
+    """Serialise on the event loop (tiny, and no other task can mutate the dict meanwhile),
+    then do the disk I/O off the loop."""
+    payload = json.dumps(guild_chatlogs, ensure_ascii=False)
+    await asyncio.to_thread(_write_guild_logs, payload)
+
+
+# Built system-prompt text per guild; dropped whenever that guild's log changes.
+_guild_context_cache: dict[int, str | None] = {}
 
 
 def _shorten(text: str, limit: int) -> str:
@@ -1008,7 +1038,7 @@ def _shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def remember_exchange(guild_id: int, user: str, question: str, answer: str, attachment_names=None):
+async def remember_exchange(guild_id: int, user: str, question: str, answer: str, attachment_names=None):
     """Store one question/answer pair in this guild's log."""
     q = question or ""
     if attachment_names:
@@ -1020,11 +1050,21 @@ def remember_exchange(guild_id: int, user: str, question: str, answer: str, atta
         "a": _shorten(answer, GUILD_LOG_ANSWER_CHARS),
     })
     del log[:-GUILD_LOG_MAX_EXCHANGES]
-    _save_guild_logs()
+    _guild_context_cache.pop(guild_id, None)
+    await _save_guild_logs()
 
 
 def build_guild_context(guild_id: int):
-    """Text to append to the system prompt for this guild, or None if there is no history."""
+    """Text to append to the system prompt for this guild, or None if there is no history.
+    Cached until remember_exchange()/!forget changes the log."""
+    if guild_id in _guild_context_cache:
+        return _guild_context_cache[guild_id]
+    result = _build_guild_context(guild_id)
+    _guild_context_cache[guild_id] = result
+    return result
+
+
+def _build_guild_context(guild_id: int):
     log = guild_chatlogs.get(str(guild_id))
     if not log:
         return None
@@ -1055,9 +1095,19 @@ def build_guild_context(guild_id: int):
              help="Clears the AI's remembered chat history for this server. Requires the Manage Server permission.")
 async def forget(ctx):
     removed = guild_chatlogs.pop(str(ctx.guild.id), None)
-    _save_guild_logs()
+    _guild_context_cache.pop(ctx.guild.id, None)
+    await _save_guild_logs()
     count = len(removed) if removed else 0
     await ctx.send(f"Cleared the AI's memory for this server ({count} remembered exchange(s)).")
+
+
+# --- Server profiles and insights (admin runs !profile buildall; members can !profile optout) ---
+# Adds !profile buildall | server | who | optout | optin. See profiler.py.
+profiler.register_commands(
+    bot,
+    command_prefix=PREFIX,
+    allowed_guilds=getattr(botkey, "ALLOWED_GUILD_ID", None),   # same restriction as !ask
+)
 
 
 # --- Run the Bot ---
