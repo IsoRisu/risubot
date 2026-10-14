@@ -1,41 +1,187 @@
 # llmclient.py
-# Text-and-image in / text out.
+# Text-and-image in / text out, with automatic fallback across several free LLM APIs.
 #
-# Text-only prompts go through freeflow-llm (provider fallback, key rotation).
-# Prompts with attachments go straight to the Gemini REST API, because
-# freeflow-llm's documented chat() takes string content only, and its fallback
-# could otherwise hand an image request to a text-only Groq model.
+# Providers (all optional except that at least one must be configured):
+#   gemini      Google Gemini (native API, the only one that takes audio/video/PDF)
+#   groq        Groq            fast, generous daily limits, has a vision model
+#   cerebras    Cerebras        very fast, ~1M tokens/day free
+#   mistral     Mistral AI      good multilingual quality, vision, ~1 request/s free
+#   nvidia      NVIDIA NIM      ~40 requests/min, big model catalogue (phone verification)
+#   openrouter  OpenRouter      many ":free" models (50 req/day, 1000/day after a one-off $10 top-up)
+#   cloudflare  Cloudflare Workers AI   10k "neurons"/day, needs an account id too
+#   sambanova   SambaNova       20 req/min but only ~20/day
+#   cohere      Cohere          Command A, strong multilingual, trial key: 20/min, 1000/month
+#   zai         Z.ai / Zhipu    GLM "Flash" models are free (1 concurrent request), has a vision model
+#   llm7        LLM7.io         no signup needed (opt-in, see below)
 #
-# Import `ask()` from your Discord bot.
+# Every provider is only used if its key is present in botkey.py. Order matters:
+# the first provider that answers wins, the rest are fallbacks.
+#
+# ---------------------------------------------------------------------------
+# botkey.py variables  (see also botkey.example.py)
+# ---------------------------------------------------------------------------
+# Each *_API_KEY may be one string or a list of strings (keys are rotated). For
+# every provider, keys from DIFFERENT accounts/projects are what gives extra quota.
+#
+#   GEMINI_API_KEY      = ["AIza...", "AIza..."]     # https://aistudio.google.com/apikey
+#   GROQ_API_KEY        = "gsk_..."                  # https://console.groq.com/keys 
+#   MISTRAL_API_KEY     = "..."                      # https://console.mistral.ai/api-keys  (free "Experiment" plan)
+#   NVIDIA_API_KEY      = "nvapi-..."                # https://build.nvidia.com  (profile -> API keys)
+#   OPENROUTER_API_KEY  = "sk-or-..."                # https://openrouter.ai/keys
+# Optional tuning (all have defaults):
+#
+#   PROVIDER_ORDER   = ["groq", "gemini", "cerebras"]   # order AND whitelist; names as in the list above
+#                                                      # (a comma separated string also works)
+#   ROTATE_PROVIDERS = True     # start each request on the next provider instead of always the first,
+#                               # which spreads usage so no single free tier is drained first
+#   <NAME>_MODELS        = ["model-a", "model-b"]       # replace a provider's text-model list, e.g. GROQ_MODELS
+#   <NAME>_VISION_MODELS = ["model-v"]                  # replace a provider's image-capable model list
+#
+# Free-tier model names change often. If a model id stops existing the provider answers
+# 404 and the client skips it for a few hours, but update the lists below (or override
+# them from botkey.py with <NAME>_MODELS) when you notice it.
+#
+# IMPORTANT: Gemini quotas are per Google Cloud *project*, not per key. Keys that
+# were created in the same project share one quota, so rotating between them
+# gains nothing. Create each key in its own project (AI Studio: "Create API key
+# in new project"). The same idea holds for the other providers: a second key from
+# the same account usually shares the account's quota.
+#
+# Usage from the bot:
+#   from llmclient import ask, Attachment, key_status, last_backend
+#   reply = ask("hello")                 # -> str
+#   last_backend()                       # -> "groq/llama-3.3-70b-versatile" (for this thread)
+#   key_status()                         # snapshot of every provider's keys, for an owner-only command
+#
+# Exceptions (the Gemini* names are kept as aliases so existing `except` clauses keep working):
+#   LLMUnavailable  / GeminiUnavailable   everything overloaded or out of quota; has .retry_after
+#   LLMBlocked      / GeminiBlocked       the model refused (safety / policy)
+#   LLMKeysRejected / GeminiKeysRejected  every key of every provider is invalid
+#   ValueError                            unsupported attachment, or no configured provider can take it
+#   RuntimeError                          every provider rejected the request itself (malformed)
 
 import base64
+import http.client
 import json
+import logging
 import mimetypes
 import os
 import random
+import re
+import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
-from botkey import GEMINI_API_KEY
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+import botkey
 
-from freeflow_llm import FreeFlowClient
+log = logging.getLogger("llmclient")
 
-# Tried in order. When the first is overloaded (503) or rate-limited (429),
-# the next one usually still has capacity; they are separate capacity pools.
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+def _cfg(name, default=None):
+    return getattr(botkey, name, default)
+
+
+def _as_list(value) -> list:
+    """A string or an iterable of strings -> list of unique, stripped, non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    try:
+        out = [v.strip() for v in value if isinstance(v, str) and v.strip()]
+    except TypeError:
+        return []
+    return list(dict.fromkeys(out))
+
+
+def _models_cfg(name: str, suffix: str, default: list) -> list:
+    """botkey.<NAME>_MODELS / <NAME>_VISION_MODELS if set, else the built-in default."""
+    override = _as_list(_cfg(f"{name.upper()}_{suffix}"))
+    return override or list(default)
+
+
+# ---------------------------------------------------------------------------
+# Models per provider (best first). Edit freely, or override from botkey.py.
+# ---------------------------------------------------------------------------
+
+# Gemini. Tried in order. When the first is overloaded (503) or rate-limited (429) on
+# every key, the next one usually still has capacity; they are separate capacity pools.
 MODEL_CHAIN = [
+    # Current generation Flash models
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3-flash",
+
+    # Current & previous generation Flash-Lite models
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
-TEXT_MODEL = MODEL_CHAIN[0]  # used for FreeFlow's last-resort attempt
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# Everything except Gemini speaks the OpenAI chat-completions dialect.
+#   models / vision   text models, and the subset that accepts images
+#   max_chars         largest prompt (+ system prompt) the free tier takes comfortably; bigger
+#                     requests go to other providers first and are clipped only as a last resort
+#   max_images        most images per request
+#   scope             what a 429 limits: "model" (only that model) or "key" (the whole account)
+#   reset             when daily quotas renew, if known: "utc" or "pacific"
+_OPENAI_SPECS = {
+    "groq": dict(
+        url="https://api.groq.com/openai/v1/chat/completions",
+        models=["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                "meta-llama/llama-4-scout-17b-16e-instruct"],
+        vision=["meta-llama/llama-4-scout-17b-16e-instruct"],
+        max_chars=30_000, max_images=5, scope="model"),
+    "mistral": dict(
+        url="https://api.mistral.ai/v1/chat/completions",
+        models=["mistral-large-latest", "mistral-medium-latest", "mistral-small-latest"],
+        vision=["mistral-small-latest", "mistral-medium-latest"],
+        max_chars=200_000, max_images=8, scope="key"),
+    "nvidia": dict(
+        url="https://integrate.api.nvidia.com/v1/chat/completions",
+        models=["meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct",
+                "meta/llama-3.1-70b-instruct"],
+        vision=["meta/llama-3.2-90b-vision-instruct"],
+        max_chars=100_000, max_images=1, scope="key"),
+    "openrouter": dict(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        models=["openrouter/free", "meta-llama/llama-3.3-70b-instruct:free",
+                "google/gemma-3-27b-it:free"],
+        vision=["google/gemma-3-27b-it:free"],
+        max_chars=100_000, max_images=4, scope="key", reset="utc",
+        extra_body={"max_tokens": 4096},
+        extra_headers={"HTTP-Referer": "https://github.com/", "X-Title": "discord-bot"}),
+}
+
+# Default provider order. First configured provider that answers wins.
+DEFAULT_PROVIDER_ORDER = ["gemini", "groq", "cerebras", "mistral", "nvidia", "openrouter",
+                          "cloudflare", "sambanova", "cohere", "zai", "llm7"]
+
+# True: each request starts on the next provider (round robin among those that can serve it),
+# so the free tiers are used evenly. False: always start at the top of the order and use the
+# rest only as fallbacks. Overridable with botkey.ROTATE_PROVIDERS.
+ROTATE_PROVIDERS = bool(_cfg("ROTATE_PROVIDERS", False))
+
+MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_URL = MODELS_URL + "/{model}:generateContent"
+
+# On the first request, ask the Gemini API which of MODEL_CHAIN actually exist (and
+# support generateContent) and drop the rest, so a retired/misspelled model id
+# never costs a round trip. If the listing fails, MODEL_CHAIN is used as-is.
+VALIDATE_MODELS = True
 
 # Soft guard against pathologically long callers. Gemini Flash accepts far more
 # than this, but an unbounded prompt from a caller like the profiler eventually
 # blows past HTTP body limits after base64 overhead, with a confusing 4xx.
 MAX_PROMPT_CHARS = 200_000
+
+USER_AGENT = "Mozilla/5.0 (compatible; llmclient/2.0; +discord-bot)"   # some CDNs reject urllib's default
 
 # Tells the model it is talking through Discord and exactly how math is shown.
 # Keep this in sync with latexrenderer.py: the "supported" list below is what
@@ -97,18 +243,9 @@ STYLE
 Be concise and clear. Discord messages are limited, so avoid long preambles. For exercises, give a numbered list with each task stated precisely, and add hints or solutions only if asked.
 """
 
-# Gemini accepts images, audio, video and PDF as inline data.
+# Gemini accepts images, audio, video and PDF as inline data. The other providers
+# take images only (and only some of their models).
 SUPPORTED_PREFIXES = ("image/", "audio/", "video/", "application/pdf")
-
-# Transient HTTP statuses worth retrying (rate limit / overloaded).
-RETRY_STATUSES = {429, 500, 502, 503, 504}
-SKIP_MODEL_STATUSES = RETRY_STATUSES | {404}  # 404: model id retired/unknown
-ATTEMPTS_PER_MODEL = 2
-REQUEST_TIMEOUT = 60
-
-
-class GeminiUnavailable(RuntimeError):
-    """Gemini is overloaded / rate-limited / unreachable (worth trying elsewhere)."""
 
 
 class Attachment:
@@ -133,12 +270,18 @@ class Attachment:
         return cls(data, mime_type or "application/octet-stream", filename)
 
     def to_part(self) -> dict:
+        """Gemini's inline_data part."""
         return {
             "inline_data": {
                 "mime_type": self.mime_type,
                 "data": base64.b64encode(self.data).decode("ascii"),
             }
         }
+
+    def to_image_url_part(self) -> dict:
+        """OpenAI-style image part (data URI)."""
+        b64 = base64.b64encode(self.data).decode("ascii")
+        return {"type": "image_url", "image_url": {"url": f"data:{self.mime_type};base64,{b64}"}}
 
 
 def build_system_prompt(guild_context: str = None) -> str:
@@ -150,82 +293,752 @@ def build_system_prompt(guild_context: str = None) -> str:
     return SYSTEM_PROMPT
 
 
-def _gemini_call(prompt: str, attachments: list, model: str, system_prompt: str = None) -> str:
-    """One model, with a short retry on transient errors."""
-    if len(prompt) > MAX_PROMPT_CHARS:
-        prompt = prompt[:MAX_PROMPT_CHARS] + "\n[truncated]"
+# ---------------------------------------------------------------------------
+# Retry / rotation tuning
+# ---------------------------------------------------------------------------
+RETRY_STATUSES = {408, 425, 500, 502, 503, 504, 529}   # transient: retry on the same key
+ATTEMPTS_PER_KEY = 2                    # tries per key for transient errors
+REQUEST_TIMEOUT = 60                    # seconds for one HTTP request to Gemini (big media)
+OPENAI_REQUEST_TIMEOUT = 40             # ... and to every other provider
+TOTAL_DEADLINE = 120                    # seconds for one whole ask(), all providers, models and keys
 
-    parts = [a.to_part() for a in attachments]
-    if prompt:
-        parts.append({"text": prompt})
+DEFAULT_429_COOLDOWN = 30               # when the provider doesn't say how long to wait
+DAILY_FALLBACK_COOLDOWN = 3600          # daily quota hit but reset time unknown: re-check hourly
+MAX_COOLDOWN = 24 * 3600
+DEAD_KEY_COOLDOWN = 3600                # invalid / revoked / out-of-credit key: re-check hourly
+FORBIDDEN_COOLDOWN = 600                # 403 that isn't clearly a dead key
+MODEL_MISSING_COOLDOWN = 6 * 3600       # 404: model id retired/unknown
+MODEL_OVERLOAD_COOLDOWN = 15            # model kept returning 5xx: try others first
 
-    request = {
-        "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": parts}],
-    }
-    body = json.dumps(request).encode("utf-8")
+# True: start each request on the next key (spreads load, keeps every key under
+# its per-minute limit). False: stay on one key until it hits a limit.
+SPREAD_LOAD = True
 
-    def make_request():
-        return urllib.request.Request(
-            GEMINI_URL.format(model=model),
-            data=body,
-            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-            method="POST",
-        )
+BLOCK_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
+                        "RECITATION", "IMAGE_SAFETY"}
 
-    payload = None
-    last_err = ""
-    for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
-        try:
-            with urllib.request.urlopen(make_request(), timeout=REQUEST_TIMEOUT) as resp:
-                payload = json.load(resp)
-            break
-        except urllib.error.HTTPError as e:
-            text = e.read().decode("utf-8", "replace")[:300]
-            last_err = f"HTTP {e.code}: {text}"
-            if e.code not in SKIP_MODEL_STATUSES:
-                # Bad key, malformed request, etc. — retrying won't help.
-                raise RuntimeError(f"Gemini {model} {last_err}") from None
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = f"network: {e}"
-        if attempt < ATTEMPTS_PER_MODEL:
-            # Jitter so two bots that were throttled at the same instant don't
-            # retry at the same instant and collide again.
-            time.sleep(random.uniform(0.7, 1.3) * 1.5 * attempt)
+# Phrases that mark a 429 as "daily quota used up" for the non-Gemini providers.
+_DAILY_HINTS = ("per day", "daily", "neurons")
+
+
+class LLMUnavailable(RuntimeError):
+    """Everything is overloaded / rate-limited / unreachable (worth trying later).
+    retry_after (seconds) is set when we know roughly when a key frees up.
+    permanent is True when the request itself was refused as malformed or unsupported."""
+
+    def __init__(self, msg, retry_after=None, permanent=False):
+        super().__init__(msg)
+        self.retry_after = retry_after
+        self.permanent = permanent
+
+
+class LLMBlocked(RuntimeError):
+    """The model refused to answer (safety / policy). Retrying another model won't help."""
+
+
+class LLMKeysRejected(RuntimeError):
+    """Every configured API key of every provider is invalid or revoked. Needs a human."""
+
+
+# Backwards compatible names.
+GeminiUnavailable = LLMUnavailable
+GeminiBlocked = LLMBlocked
+GeminiKeysRejected = LLMKeysRejected
+
+_ALL_KEYS = []          # every configured secret, for log redaction
+
+
+def _redact(s: str) -> str:
+    for k in _ALL_KEYS:
+        s = s.replace(k, "***")
+    return s
+
+
+def _brief(text: str, limit: int = 200) -> str:
+    return _redact(" ".join((text or "").split()))[:limit]
+
+
+def _clip(prompt: str, limit: int) -> str:
+    """Shorten an over-long prompt, keeping the start and (more importantly) the end:
+    that's usually where the question is."""
+    if limit <= 0 or len(prompt) <= limit:
+        return prompt
+    head = int(limit * 0.6)
+    tail = limit - head
+    return prompt[:head] + "\n[... truncated ...]\n" + prompt[-tail:]
+
+
+# ---------------------------------------------------------------------------
+# Key pool: all rotation state of ONE provider lives here, behind one lock.
+# ---------------------------------------------------------------------------
+class _KeyPool:
+    def __init__(self, n: int):
+        self.n = n
+        self.lock = threading.Lock()
+        self.cursor = 0
+        self.key_until = [0.0] * n          # whole key unusable until (monotonic)
+        self.key_reason = [""] * n
+        self.pair_until = {}                # (key idx, model) -> monotonic time
+        self.model_until = {}               # model overloaded -> monotonic time
+        self.missing_until = {}             # model does not exist -> monotonic time
+
+    def plan(self, model: str):
+        """(ordered key indices usable for this model right now, soonest wait if none)."""
+        now = time.monotonic()
+        with self.lock:
+            start = self.cursor
+            if SPREAD_LOAD:
+                self.cursor = (self.cursor + 1) % self.n
+            order, soonest = [], None
+            for i in range(self.n):
+                idx = (start + i) % self.n
+                until = max(self.key_until[idx], self.pair_until.get((idx, model), 0.0))
+                if until <= now:
+                    order.append(idx)
+                else:
+                    w = until - now
+                    soonest = w if soonest is None else min(soonest, w)
+            return order, soonest
+
+    def stick(self, idx: int):
+        if not SPREAD_LOAD:
+            with self.lock:
+                self.cursor = idx
+
+    def cool_pair(self, idx: int, model: str, secs: float):
+        with self.lock:
+            self.pair_until[(idx, model)] = time.monotonic() + min(secs, MAX_COOLDOWN)
+
+    def cool_key(self, idx: int, secs: float, reason: str):
+        with self.lock:
+            self.key_until[idx] = time.monotonic() + min(secs, MAX_COOLDOWN)
+            self.key_reason[idx] = reason
+
+    def cool_model(self, model: str, secs: float):
+        with self.lock:
+            self.model_until[model] = time.monotonic() + secs
+
+    def cool_missing(self, model: str, secs: float):
+        with self.lock:
+            self.missing_until[model] = time.monotonic() + secs
+
+    def model_cooling(self, model: str) -> bool:
+        with self.lock:
+            return self.model_until.get(model, 0.0) > time.monotonic()
+
+    def model_missing(self, model: str) -> bool:
+        with self.lock:
+            return self.missing_until.get(model, 0.0) > time.monotonic()
+
+    def soonest_wait(self):
+        """Seconds until any key / (key, model) cooldown ends, or None."""
+        now = time.monotonic()
+        with self.lock:
+            ends = [u - now for u in self.pair_until.values() if u > now]
+            ends += [u - now for u in self.key_until if u > now]
+            return min(ends) if ends else None
+
+    def all_rejected(self) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            return all(self.key_until[i] > now and self.key_reason[i] == "invalid" for i in range(self.n))
+
+    def snapshot(self, provider: str):
+        now = time.monotonic()
+        with self.lock:
+            out = []
+            for i in range(self.n):
+                cooling = {m: round(u - now) for (k, m), u in self.pair_until.items() if k == i and u > now}
+                state = "ok"
+                if self.key_until[i] > now:
+                    state = self.key_reason[i] or "cooling"
+                out.append({"provider": provider, "key": f"#{i + 1}", "state": state,
+                            "cooling_models": cooling})
+            return out
+
+
+# ---------------------------------------------------------------------------
+# Error handling helpers
+# ---------------------------------------------------------------------------
+def _secs_until_pacific_midnight() -> float:
+    """Gemini's daily quotas reset at midnight Pacific time."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return (nxt - now).total_seconds() + 5
+    except Exception:
+        return 3600.0   # no tz database (e.g. Windows without tzdata): re-check hourly
+
+
+def _secs_until_utc_midnight() -> float:
+    now = datetime.now(timezone.utc)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (nxt - now).total_seconds() + 5
+
+
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|h|m|s)")
+_RETRY_IN_RE = re.compile(r"(?:try again|retry|reset|resets|available)\s+in\s+((?:\d+(?:\.\d+)?\s*(?:ms|h|m|s)\s*)+)")
+
+
+def _parse_duration(text: str):
+    """'2m59.5s' / '7.5s' / '350ms' / '1h2m' -> seconds, or None."""
+    total, found = 0.0, False
+    for num, unit in _DURATION_PART.findall(text or ""):
+        found = True
+        n = float(num)
+        total += n * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+    return total if found else None
+
+
+def _quota_cooldown(p, text: str, headers) -> float:
+    """How long to leave a (key, model) / key alone after a 429, from the provider's own hints."""
+    delay, daily = None, False
+
+    try:
+        ra = headers.get("Retry-After") if headers is not None else None
+        if ra:
+            delay = float(ra)
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, list) and data:
+            data = data[0]
+        err = data.get("error", data) if isinstance(data, dict) else {}
+        if isinstance(err, dict):
+            for d in err.get("details", []) or []:
+                t = d.get("@type", "")
+                if t.endswith("RetryInfo") and d.get("retryDelay") and delay is None:
+                    delay = _parse_duration(str(d["retryDelay"]))
+                elif t.endswith("QuotaFailure"):
+                    for v in d.get("violations", []) or []:
+                        if "perday" in (str(v.get("quotaId", "")) + str(v.get("quotaMetric", ""))).lower():
+                            daily = True
+            if delay is None:
+                m = re.search(r"retry in ([\d.]+)s", str(err.get("message", "")))
+                if m:
+                    delay = float(m.group(1))
+            # OpenRouter: absolute reset time (ms since epoch) in the error metadata.
+            hdrs = (err.get("metadata") or {}).get("headers") or {}
+            reset = hdrs.get("X-RateLimit-Reset")
+            if reset is not None and delay is None:
+                d = float(reset) / 1000.0 - time.time()
+                if d > 0:
+                    delay = d
+    except (ValueError, AttributeError, TypeError):
+        pass
+
+    low = re.sub(r"[-_]+", " ", text.lower())
+    if delay is None:
+        m = _RETRY_IN_RE.search(low)
+        if m:
+            delay = _parse_duration(m.group(1))
+    if p.name != "gemini" and any(s in low for s in _DAILY_HINTS):
+        daily = True
+
+    if daily:
+        if delay is not None and delay >= 120:
+            secs = delay                         # the provider told us exactly
+        else:
+            secs = p.secs_until_reset() or delay or DAILY_FALLBACK_COOLDOWN
     else:
-        raise GeminiUnavailable(f"{model}: {last_err}")
-
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        reason = (payload.get("promptFeedback") or {}).get("blockReason")
-        raise RuntimeError(f"No candidates returned (blockReason={reason}): {json.dumps(payload)[:300]}")
-
-    candidate = candidates[0]
-    parts_out = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(p["text"] for p in parts_out if "text" in p).strip()
-    if not text:
-        raise RuntimeError(f"Empty response (finishReason={candidate.get('finishReason')})")
-    return text
+        secs = delay if delay is not None else DEFAULT_429_COOLDOWN
+    return min(secs, MAX_COOLDOWN) + random.uniform(0.5, 1.5)
 
 
-def _gemini_generate(prompt: str, attachments: list, system_prompt: str = None) -> str:
-    """Walk MODEL_CHAIN until one model answers.
+def _handle_http_error(p, idx: int, model: str, code: int, text: str, headers=None) -> str:
+    """Apply cooldowns for an HTTP error. Returns what the caller should do:
+    'rotate' (try the next key), 'transient' (retry same key), 'model_missing', 'skip'
+    (this request/model can't be served here: move on, no cooldown)."""
+    low = text.lower()
+    pool = p.pool
+    label = f"{p.name} key#{idx + 1}"
+    if code == 429:
+        secs = _quota_cooldown(p, text, headers)
+        if p.quota_scope == "key":
+            pool.cool_key(idx, secs, "rate-limited")
+            log.warning("%s rate-limited, cooling the key %.0fs", label, secs)
+        else:
+            pool.cool_pair(idx, model, secs)
+            log.warning("%s rate-limited on %s, cooling %.0fs", label, model, secs)
+        return "rotate"
+    if code == 402:
+        pool.cool_key(idx, DEAD_KEY_COOLDOWN, "no-credit")
+        log.warning("%s has no credit left (HTTP 402)", label)
+        return "rotate"
+    if code == 404:
+        pool.cool_missing(model, MODEL_MISSING_COOLDOWN)
+        log.warning("%s: model %s not found (404), skipping it for a while", p.name, model)
+        return "model_missing"
+    if code in RETRY_STATUSES:
+        return "transient"
+    if code == 401 or (code == 400 and any(s in low for s in ("api_key_invalid", "api key not valid", "api key expired"))):
+        pool.cool_key(idx, DEAD_KEY_COOLDOWN, "invalid")
+        log.error("%s was rejected as invalid (HTTP %d)", label, code)
+        return "rotate"
+    if code == 403:
+        if any(s in low for s in ("leaked", "suspended", "disabled")):
+            pool.cool_key(idx, DEAD_KEY_COOLDOWN, "invalid")
+            log.error("%s looks revoked/suspended (HTTP 403)", label)
+        else:
+            pool.cool_pair(idx, model, FORBIDDEN_COOLDOWN)
+            log.warning("%s forbidden on %s (HTTP 403)", label, model)
+        return "rotate"
+    # 400 / 413 / 422 / anything else: the request doesn't suit this model (too big, no
+    # image support, bad parameter). Another model or provider may still take it.
+    log.warning("%s: %s answered HTTP %d: %s", p.name, model, code, _brief(text, 160))
+    return "skip"
 
-    On a fully-transient first pass (every model raised GeminiUnavailable), sleep
-    briefly and try the chain once more. A bad API key raises RuntimeError from
-    _gemini_call and propagates straight out, so this never masks a permanent
-    failure as a retryable one.
-    """
-    errors = []
-    for pass_no in range(2):
-        for model in MODEL_CHAIN:
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+class _Provider:
+    """One backend: its keys, its models, its quota state, and the HTTP dialect."""
+
+    name = ""
+    accepts_media = False        # audio / video / PDF
+    quota_scope = "model"        # what a 429 limits: "model" or "key"
+    reset = None                 # "utc" | "pacific" | None
+    request_timeout = OPENAI_REQUEST_TIMEOUT
+    max_chars = 100_000
+    max_images = 0
+
+    def __init__(self, keys: list, models: list, vision_models: list):
+        self.keys = keys
+        self.models = models
+        self.vision_models = vision_models
+        self.pool = _KeyPool(len(keys))
+
+    # -- capabilities ------------------------------------------------------
+    def secs_until_reset(self):
+        if self.reset == "pacific":
+            return _secs_until_pacific_midnight()
+        if self.reset == "utc":
+            return _secs_until_utc_midnight()
+        return None
+
+    def can_handle(self, attachments: list) -> bool:
+        if not attachments:
+            return True
+        if any(not a.mime_type.startswith("image/") for a in attachments) and not self.accepts_media:
+            return False
+        return bool(self.vision_models) and len(attachments) <= self.max_images
+
+    def candidates(self, need_vision: bool) -> list:
+        """Models to try for this request, best first. Ones that returned 404 are left out;
+        ones that were overloaded a moment ago go last rather than being skipped."""
+        if need_vision:
+            base = list(self.vision_models)
+        else:
+            base = list(self.models) + [m for m in self.vision_models if m not in self.models]
+        base = [m for m in base if not self.pool.model_missing(m)]
+        return [m for m in base if not self.pool.model_cooling(m)] + [m for m in base if self.pool.model_cooling(m)]
+
+    # -- HTTP dialect (overridden) ----------------------------------------
+    def url(self, model: str, idx: int) -> str:
+        raise NotImplementedError
+
+    def headers(self, idx: int) -> dict:
+        raise NotImplementedError
+
+    def build_body(self, model: str, prompt: str, attachments: list, system_prompt: str) -> bytes:
+        raise NotImplementedError
+
+    def parse(self, payload: dict, model: str) -> str:
+        raise NotImplementedError
+
+    def _post(self, model: str, idx: int, body: bytes, timeout: float) -> dict:
+        req = urllib.request.Request(self.url(model, idx), data=body, headers=self.headers(idx), method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+
+    # -- one model, all keys ----------------------------------------------
+    def call(self, prompt: str, attachments: list, model: str, system_prompt: str, deadline: float) -> str:
+        """One model of this provider. Tries every key that isn't cooling down; rotates on
+        429 / rejected keys, retries transient errors on the same key with a short jittered
+        backoff.
+
+        Raises LLMUnavailable if no key could answer, LLMBlocked if the model refused the
+        content."""
+        label = f"{self.name}/{model}"
+        body = self.build_body(model, prompt, attachments, system_prompt)
+
+        order, soonest = self.pool.plan(model)
+        if not order:
+            raise LLMUnavailable(
+                f"{label}: every key is cooling down" + (f" (next frees in {soonest:.0f}s)" if soonest else ""),
+                retry_after=soonest,
+            )
+
+        last_err = ""
+        for idx in order:
+            for attempt in range(1, ATTEMPTS_PER_KEY + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 1:
+                    raise LLMUnavailable(f"{label}: out of time ({last_err})")
+                try:
+                    payload = self._post(model, idx, body, min(self.request_timeout, remaining))
+                except urllib.error.HTTPError as e:
+                    text = e.read().decode("utf-8", "replace")[:2000]
+                    last_err = f"key#{idx + 1} HTTP {e.code}: {_brief(text, 120)}"
+                    kind = _handle_http_error(self, idx, model, e.code, text, e.headers)
+                    if kind == "rotate":
+                        break                               # next key, no sleeping
+                    if kind == "model_missing":
+                        raise LLMUnavailable(f"{label}: not found")
+                    if kind == "skip":
+                        raise LLMUnavailable(f"{label}: {last_err}", permanent=True)
+                    # "transient": fall through to backoff + retry on this key
+                except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+                    # URLError/timeouts, connection reset mid-body, truncated or non-JSON body
+                    last_err = f"key#{idx + 1} {type(e).__name__}: {_brief(str(e), 120)}"
+                else:
+                    self.pool.stick(idx)
+                    return self.parse(payload, model)
+                if attempt < ATTEMPTS_PER_KEY:
+                    pause = random.uniform(0.7, 1.3) * 1.5 * attempt
+                    time.sleep(max(0.0, min(pause, deadline - time.monotonic() - 1)))
+            else:
+                # Transient errors on every attempt: the model itself is struggling and
+                # another key won't change that. Let the next model go first for a while.
+                self.pool.cool_model(model, MODEL_OVERLOAD_COOLDOWN)
+                raise LLMUnavailable(f"{label}: {last_err}")
+
+        raise LLMUnavailable(f"{label}: no key could answer ({last_err})", retry_after=self.pool.soonest_wait())
+
+
+class _GeminiProvider(_Provider):
+    name = "gemini"
+    accepts_media = True
+    quota_scope = "model"
+    reset = "pacific"
+    request_timeout = REQUEST_TIMEOUT
+    max_chars = MAX_PROMPT_CHARS
+    max_images = 10_000
+
+    def __init__(self, keys: list, models: list):
+        super().__init__(keys, models, models)
+        self._chain_lock = threading.Lock()
+        self._chain = None
+
+    def _list_models(self) -> set:
+        """Names of models that support generateContent, using the first key that works."""
+        last = None
+        for key in self.keys:
+            names, token = set(), None
             try:
-                return _gemini_call(prompt, attachments, model, system_prompt)
-            except GeminiUnavailable as e:
-                errors.append(f"pass{pass_no}/{model}: {e}")
-        if pass_no == 0:
-            time.sleep(random.uniform(1.5, 3.0))
-    raise GeminiUnavailable("All Gemini models unavailable: " + " | ".join(errors))
+                while True:
+                    url = MODELS_URL + "?pageSize=1000" + (f"&pageToken={token}" if token else "")
+                    req = urllib.request.Request(url, headers={"x-goog-api-key": key, "User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.load(resp)
+                    for m in data.get("models", []):
+                        if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                            names.add(m.get("name", "").removeprefix("models/"))
+                    token = data.get("nextPageToken")
+                    if not token:
+                        return names
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+                last = e
+        raise RuntimeError(f"model listing failed: {last}")
+
+    def _validated(self) -> list:
+        if self._chain is not None:
+            return self._chain
+        with self._chain_lock:
+            if self._chain is None:
+                chain = list(self.models)
+                if VALIDATE_MODELS:
+                    try:
+                        available = self._list_models()
+                        kept = [m for m in self.models if m in available]
+                        dropped = [m for m in self.models if m not in available]
+                        if dropped:
+                            log.warning("Gemini models not offered by the API, dropped: %s", ", ".join(dropped))
+                        if kept:
+                            chain = kept
+                        else:
+                            log.warning("none of the Gemini models found in the model list; using them unchanged")
+                    except Exception as e:
+                        log.warning("could not validate the Gemini model list (%s); using it unchanged", _brief(str(e)))
+                self._chain = chain
+        return self._chain
+
+    def candidates(self, need_vision: bool) -> list:
+        base = [m for m in self._validated() if not self.pool.model_missing(m)]
+        return [m for m in base if not self.pool.model_cooling(m)] + [m for m in base if self.pool.model_cooling(m)]
+
+    def url(self, model, idx):
+        return GEMINI_URL.format(model=model)
+
+    def headers(self, idx):
+        return {"Content-Type": "application/json", "x-goog-api-key": self.keys[idx], "User-Agent": USER_AGENT}
+
+    def build_body(self, model, prompt, attachments, system_prompt):
+        parts = [a.to_part() for a in attachments]
+        if prompt:
+            parts.append({"text": prompt})
+        return json.dumps({
+            "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": parts}],
+        }).encode("utf-8")
+
+    def parse(self, payload, model):
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            reason = (payload.get("promptFeedback") or {}).get("blockReason")
+            if reason:
+                raise LLMBlocked(f"Gemini blocked the request ({reason}).")
+            raise LLMUnavailable(f"gemini/{model}: response had no candidates")
+        candidate = candidates[0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        text = "".join(p["text"] for p in parts if "text" in p and not p.get("thought")).strip()
+        if not text:
+            reason = candidate.get("finishReason")
+            if reason in BLOCK_FINISH_REASONS:
+                raise LLMBlocked(f"Gemini declined to answer ({reason}).")
+            # MAX_TOKENS spent on thinking, OTHER, ...: another model may do better.
+            raise LLMUnavailable(f"gemini/{model}: empty response (finishReason={reason})")
+        return text
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+class _OpenAIProvider(_Provider):
+    """Any OpenAI-compatible /chat/completions endpoint."""
+
+    def __init__(self, name, keys, models, vision_models, spec, accounts=None):
+        super().__init__(keys, models, vision_models)
+        self.name = name
+        self._url = spec["url"]
+        self.max_chars = spec.get("max_chars", 100_000)
+        self.max_images = spec.get("max_images", 0)
+        self.quota_scope = spec.get("scope", "model")
+        self.reset = spec.get("reset")
+        self.extra_body = dict(spec.get("extra_body") or {})
+        self.extra_headers = dict(spec.get("extra_headers") or {})
+        self.accounts = accounts or []       # per-key account ids (Cloudflare)
+
+    def url(self, model, idx):
+        if self.accounts:
+            return self._url.format(account=self.accounts[idx])
+        return self._url
+
+    def headers(self, idx):
+        h = {"Content-Type": "application/json", "Accept": "application/json",
+             "Authorization": f"Bearer {self.keys[idx]}", "User-Agent": USER_AGENT}
+        h.update(self.extra_headers)
+        return h
+
+    def build_body(self, model, prompt, attachments, system_prompt):
+        if attachments:
+            content = [a.to_image_url_part() for a in attachments]
+            content.append({"type": "text", "text": prompt or "Describe the image."})
+        else:
+            content = prompt or "(empty message)"     # plain string: the most widely accepted form
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+        }
+        body.update(self.extra_body)
+        return json.dumps(body).encode("utf-8")
+
+    def parse(self, payload, model):
+        choices = payload.get("choices") or []
+        if not choices:
+            err = payload.get("error")
+            detail = _brief(json.dumps(err, ensure_ascii=False)) if err else "no choices"
+            raise LLMUnavailable(f"{self.name}/{model}: {detail}")
+        choice = choices[0]
+        content = (choice.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content
+                              if isinstance(p, dict) and p.get("type") in (None, "text"))
+        text = _THINK_RE.sub("", content or "").strip()
+        if not text:
+            reason = choice.get("finish_reason")
+            if reason == "content_filter":
+                raise LLMBlocked("The model declined to answer (content_filter).")
+            raise LLMUnavailable(f"{self.name}/{model}: empty response (finish_reason={reason})")
+        return text
+
+
+# ---------------------------------------------------------------------------
+# Provider registry
+# ---------------------------------------------------------------------------
+def _cloudflare_pairs():
+    """[(token, account_id)], unique. CLOUDFLARE_ACCOUNT_ID is one id or a list aligned with the keys."""
+    keys = _as_list_keep(_cfg("CLOUDFLARE_API_KEY"))
+    ids = _as_list_keep(_cfg("CLOUDFLARE_ACCOUNT_ID"))
+    if not keys:
+        return []
+    if not ids:
+        log.warning("CLOUDFLARE_API_KEY is set but CLOUDFLARE_ACCOUNT_ID is missing; Cloudflare disabled")
+        return []
+    if len(ids) == 1:
+        ids = ids * len(keys)
+    if len(ids) != len(keys):
+        log.warning("CLOUDFLARE_ACCOUNT_ID must be one id or one per key; Cloudflare disabled")
+        return []
+    return list(dict.fromkeys(zip(keys, ids)))
+
+
+def _as_list_keep(value) -> list:
+    """Like _as_list but keeps duplicates and order (needed to align keys with account ids)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    try:
+        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+    except TypeError:
+        return []
+
+
+def _build_providers() -> list:
+    built = {}
+
+    gkeys = _as_list(_cfg("GEMINI_API_KEY"))
+    if gkeys:
+        built["gemini"] = _GeminiProvider(gkeys, _models_cfg("GEMINI", "MODELS", MODEL_CHAIN))
+
+    for name, spec in _OPENAI_SPECS.items():
+        accounts = None
+        if name == "cloudflare":
+            pairs = _cloudflare_pairs()
+            keys = [k for k, _ in pairs]
+            accounts = [a for _, a in pairs]
+        elif name == "llm7":
+            keys = _as_list(_cfg("LLM7_API_KEY"))
+            if not keys and _cfg("LLM7_ENABLED", False):
+                keys = ["unused"]              # LLM7 accepts any token when you have none
+        else:
+            keys = _as_list(_cfg(f"{name.upper()}_API_KEY"))
+        if not keys:
+            continue
+        models = _models_cfg(name, "MODELS", spec["models"])
+        vision = _models_cfg(name, "VISION_MODELS", spec["vision"])
+        built[name] = _OpenAIProvider(name, keys, models, vision, spec, accounts)
+
+    order = _cfg("PROVIDER_ORDER") or DEFAULT_PROVIDER_ORDER
+    if isinstance(order, str):
+        order = [s.strip() for s in order.split(",")]
+    order = [str(s).strip().lower() for s in order if str(s).strip()]
+
+    unknown = [n for n in order if n not in DEFAULT_PROVIDER_ORDER]
+    if unknown:
+        log.warning("PROVIDER_ORDER names unknown providers: %s", ", ".join(unknown))
+    left_out = [n for n in built if n not in order]
+    if left_out:
+        log.warning("providers with keys but not listed in PROVIDER_ORDER (disabled): %s", ", ".join(left_out))
+
+    providers = [built[n] for n in dict.fromkeys(order) if n in built]
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider is configured. Set at least one of GEMINI_API_KEY, GROQ_API_KEY, "
+            "CEREBRAS_API_KEY, MISTRAL_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY, "
+            "CLOUDFLARE_API_KEY (+ CLOUDFLARE_ACCOUNT_ID), SAMBANOVA_API_KEY, COHERE_API_KEY, "
+            "ZAI_API_KEY or LLM7_ENABLED in botkey.py")
+
+    for p in providers:
+        _ALL_KEYS.extend(k for k in p.keys if len(k) >= 8)
+    for p in providers:
+        for acct in getattr(p, "accounts", []):
+            if len(acct) >= 8:
+                _ALL_KEYS.append(acct)
+    return providers
+
+
+_providers = _build_providers()
+_rotate_lock = threading.Lock()
+_rotate_cursor = 0
+_tls = threading.local()
+
+
+def providers_configured() -> list:
+    """Names of the active providers, in order."""
+    return [p.name for p in _providers]
+
+
+def key_status() -> list:
+    """Rotation state per key, without exposing the keys:
+    [{'provider': 'groq', 'key': '#1', 'state': 'ok'|'invalid'|'rate-limited'|'no-credit', 'cooling_models': {model: secs}}]"""
+    rows = []
+    for p in _providers:
+        rows.extend(p.pool.snapshot(p.name))
+    return rows
+
+
+def last_backend():
+    """'provider/model' that answered the last ask() made by the calling thread, or None."""
+    return getattr(_tls, "backend", None)
+
+
+# ---------------------------------------------------------------------------
+# The provider chain
+# ---------------------------------------------------------------------------
+def _generate(prompt: str, attachments: list, system_prompt: str) -> str:
+    """Walk providers (and each one's models) until something answers."""
+    global _rotate_cursor
+    deadline = time.monotonic() + TOTAL_DEADLINE
+    need_vision = bool(attachments)
+
+    capable = [p for p in _providers if p.can_handle(attachments)]
+    if not capable:
+        kinds = sorted({a.mime_type for a in attachments})
+        raise ValueError(
+            f"None of the configured providers ({', '.join(providers_configured())}) can take this "
+            f"attachment ({', '.join(kinds)}, {len(attachments)} file(s)). "
+            "Audio, video and PDF need GEMINI_API_KEY; images need a provider with a vision model.")
+
+    size = len(prompt) + len(system_prompt)
+    fits = [p for p in capable if size <= p.max_chars]
+    too_big = [p for p in capable if size > p.max_chars]
+    if ROTATE_PROVIDERS and len(fits) > 1:
+        with _rotate_lock:
+            shift = _rotate_cursor % len(fits)
+            _rotate_cursor += 1
+        fits = fits[shift:] + fits[:shift]
+    # Providers whose free tier is too small for this prompt come last, with the prompt clipped.
+    plan = [(p, False) for p in fits] + [(p, True) for p in too_big]
+
+    errors, waits, perms = [], [], []
+    for p, clip in plan:
+        if time.monotonic() >= deadline:
+            errors.append("deadline reached")
+            perms.append(False)
+            break
+        pr = _clip(prompt, p.max_chars - len(system_prompt)) if clip else prompt
+        for model in p.candidates(need_vision):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                text = p.call(pr, attachments, model, system_prompt, deadline)
+            except LLMUnavailable as e:
+                errors.append(str(e))
+                perms.append(e.permanent)
+                if e.retry_after is not None:
+                    waits.append(e.retry_after)
+                continue
+            _tls.backend = f"{p.name}/{model}"
+            log.info("answered by %s", _tls.backend)
+            return text
+
+    if all(p.pool.all_rejected() for p in _providers):
+        raise LLMKeysRejected("All API keys of all providers were rejected as invalid. Check botkey.py.")
+    if errors and all(perms):
+        raise RuntimeError("Every provider rejected the request: " + " | ".join(errors))
+    log.warning("all providers unavailable: %s", " | ".join(errors))
+    soonest = [w for w in (p.pool.soonest_wait() for p in _providers) if w is not None]
+    raise LLMUnavailable(" | ".join(errors),
+                         retry_after=min(waits) if waits else (min(soonest) if soonest else None))
 
 
 def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
@@ -233,11 +1046,17 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     Send a prompt, optionally with attachments (list of Attachment), and
     return the reply as a string.
 
-    Tries each model in MODEL_CHAIN; text-only prompts fall back to FreeFlow
-    as a last resort. Attachments never go through FreeFlow.
+    Tries the configured providers in order (see PROVIDER_ORDER), each with its
+    model chain, rotating API keys on 429 / rejected keys. guild_context
+    (optional) is extra text appended to the system prompt for this one call,
+    used by the bot to give each Discord server its own memory.
 
-    guild_context (optional) is extra text appended to the system prompt for
-    this one call, used by the bot to give each Discord server its own memory.
+    Images work with every provider that has a vision model; audio, video and
+    PDF need Gemini. Which backend answered is available from last_backend().
+
+    Raises LLMUnavailable (retry later), LLMBlocked (content refused),
+    LLMKeysRejected (all keys invalid), ValueError (unsupported attachment) or
+    RuntimeError (malformed request).
     """
     attachments = attachments or []
     system_prompt = build_system_prompt(guild_context)
@@ -246,37 +1065,25 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
         if not a.mime_type.startswith(SUPPORTED_PREFIXES):
             raise ValueError(f"Unsupported attachment type: {a.mime_type}")
 
-    if attachments:
-        # Only Gemini can take these; FreeFlow's other providers are text-only.
-        return _gemini_generate(prompt, attachments, system_prompt)
+    prompt = _clip(prompt or "", MAX_PROMPT_CHARS)
 
-    # Text only: direct Gemini with model fallback first, because FreeFlow
-    # with just a Gemini key has nothing to fall back to. If Gemini is down
-    # entirely, FreeFlow gets a turn (useful if you add Groq/etc. keys).
     try:
-        return _gemini_generate(prompt, [], system_prompt)
-    except GeminiUnavailable as gemini_err:
-        try:
-            with FreeFlowClient() as client:
-                response = client.chat(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    model=TEXT_MODEL,
-                )
-                return (response.content or "").strip()
-        except Exception as ff_err:
-            raise GeminiUnavailable(
-                "The AI is overloaded right now, please try again in a minute. "
-                f"({str(gemini_err)[:300]})"
-            ) from None
+        return _generate(prompt, attachments, system_prompt)
+    except LLMUnavailable as e:
+        # Full per-model detail is in the log; keep the chat message short.
+        hint = f" Try again in about {int(e.retry_after) + 1} s." if e.retry_after else " Please try again in a minute."
+        raise LLMUnavailable("The AI is overloaded or out of quota right now." + hint,
+                             retry_after=e.retry_after) from None
 
 
 def main():
-    """Interactive loop. Prefix a line with `file:<path>` to attach something."""
-    print("FreeFlow LLM test. Attach with: file:/path/to/img.png what is this?")
-    print("Type 'quit' to exit.\n")
+    """Interactive loop. Prefix a line with `file:<path>` to attach something.
+    Type `status` to see the key rotation state."""
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    print("LLM test. Attach with: file:/path/to/img.png what is this?")
+    for p in _providers:
+        print(f"  {p.name}: {len(p.keys)} key(s), {len(p.models)} model(s)")
+    print("Type 'status' for key state, 'quit' to exit.\n")
     while True:
         try:
             user_input = input("You: ").strip()
@@ -289,6 +1096,11 @@ def main():
         if user_input.lower() in {"quit", "exit"}:
             print("Bye.")
             break
+        if user_input.lower() == "status":
+            for row in key_status():
+                print(f"  {row['provider']} key {row['key']}: {row['state']} {row['cooling_models'] or ''}")
+            print()
+            continue
 
         attachments = []
         while user_input.startswith("file:"):
@@ -306,7 +1118,7 @@ def main():
 
         try:
             reply = ask(user_input, attachments)
-            print(f"Bot: {reply}\n")
+            print(f"Bot ({last_backend()}): {reply}\n")
         except Exception as e:
             print(f"[error] {type(e).__name__}: {e}\n")
 

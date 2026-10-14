@@ -48,6 +48,9 @@ desktop.ini
 *.swo
 *~
 
+# --- Claude Code local settings ---
+.claude/settings.local.json
+
 # --- Spotify token cache ---
 .cache
 .cache/

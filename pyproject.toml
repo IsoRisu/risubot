@@ -13,8 +13,12 @@ PyNaCl = "^1.5.0"
 freeflow-llm = "*"
 matplotlib = "^3.8"
 spotipy = "*"
+requests = "*"  # imported directly by risubot.py (Spotify embed fallback); was only present via spotipy
 chromadb = "^1.0"
 sentence-transformers = {version = ">=3.0", optional = true}  # local profiler (pulls in PyTorch)
+# llmclient.py uses zoneinfo ("America/Los_Angeles") to time daily-quota cooldowns.
+# Windows has no system tz database, so it needs this package; elsewhere it's a no-op.
+tzdata = {version = "*", markers = "sys_platform == 'win32'"}
 
 [tool.poetry.extras]
 local-profiler = ["sentence-transformers"]
