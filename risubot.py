@@ -1128,7 +1128,7 @@ def _create_scrabble_room(rules: str) -> dict:
         raise RuntimeError(data.get("error") or f"Scrabble server returned HTTP {r.status_code}")
     return data
 
-
+# test
 @bot.command(name="scrabble", help="Creates a multiplayer Scrabble game and posts the link. Usage: !scrabble [rules]")
 @commands.cooldown(1, 30, commands.BucketType.user)
 async def scrabble_command(ctx, rules: str = "strict"):
