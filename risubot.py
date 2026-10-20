@@ -1115,11 +1115,45 @@ profiler.register_commands(
 # Base URL of the deployed game. Override with scrabble_url in botkey.py if it ever changes.
 SCRABBLE_BASE_URL = getattr(botkey, "scrabble_url", "https://scrabble-0ae5.onrender.com").rstrip("/")
 
+# Options accepted by !scrabble, in any order. Old rule names still work.
+SCRABBLE_MODES = {"wild": "wild", "classic": "classic", "strict": "wild", "challenge": "classic"}
+SCRABBLE_LENGTHS = {"short": 50, "medium": 75, "full": 100}  # tiles in the bag
+SCRABBLE_TIMERS = ("off", "30s", "60s", "90s", "2m", "3m", "5m")
+SCRABBLE_TIMER_ALIASES = {
+    "none": "off", "notimer": "off", "no": "off",
+    "30": "30s", "60": "60s", "1m": "60s", "90": "90s", "120": "2m", "120s": "2m",
+    "180": "3m", "180s": "3m", "300": "5m", "300s": "5m",
+}
+SCRABBLE_USAGE = (
+    "Usage: `!scrabble [wild|classic] [short|medium|full] [off|30s|60s|90s|2m|3m|5m]` "
+    "(any order, all optional). Example: `!scrabble wild short 60s`"
+)
 
-def _create_scrabble_room(rules: str) -> dict:
-    """Blocking call, run in a thread. Returns the server's JSON ({code, path, url, rules})."""
+
+def _parse_scrabble_options(options) -> dict:
+    """Turn ('wild', 'short', '60s') into {'mode': 'wild', 'length': 'short', 'timer': '60s'}."""
+    settings = {}
+    for raw in options:
+        token = raw.lower().strip()
+        if token in SCRABBLE_MODES:
+            key, value = "mode", SCRABBLE_MODES[token]
+        elif token in SCRABBLE_LENGTHS:
+            key, value = "length", token
+        elif token in SCRABBLE_TIMERS or token in SCRABBLE_TIMER_ALIASES:
+            key, value = "timer", SCRABBLE_TIMER_ALIASES.get(token, token)
+        else:
+            raise ValueError(f"I don't know the option `{raw[:30]}`.")
+        if key in settings and settings[key] != value:
+            raise ValueError(f"You gave two different values for the {key}.")
+        settings[key] = value
+    return settings
+
+
+def _create_scrabble_room(settings: dict) -> dict:
+    """Blocking call, run in a thread. Returns the server's JSON
+    ({code, path, url, mode, length, timer})."""
     # Long timeout: Render's free tier sleeps when idle and a cold start can take ~30-60 s.
-    r = requests.post(f"{SCRABBLE_BASE_URL}/create", json={"rules": rules}, timeout=90)
+    r = requests.post(f"{SCRABBLE_BASE_URL}/create", json=settings, timeout=90)
     try:
         data = r.json()
     except ValueError:
@@ -1128,13 +1162,21 @@ def _create_scrabble_room(rules: str) -> dict:
         raise RuntimeError(data.get("error") or f"Scrabble server returned HTTP {r.status_code}")
     return data
 
-# test
-@bot.command(name="scrabble", help="Creates a multiplayer Scrabble game and posts the link. Usage: !scrabble [rules]")
+
+@bot.command(name="scrabble", help="Creates a multiplayer Scrabble game and posts the link. "
+                                   "Usage: !scrabble [wild|classic] [short|medium|full] [off|30s|60s|90s|2m|3m|5m]")
 @commands.cooldown(1, 30, commands.BucketType.user)
-async def scrabble_command(ctx, rules: str = "strict"):
+async def scrabble_command(ctx, *options: str):
+    try:
+        settings = _parse_scrabble_options(options)
+    except ValueError as e:
+        scrabble_command.reset_cooldown(ctx)  # a typo shouldn't cost them the cooldown
+        await ctx.reply(f"{e}\n{SCRABBLE_USAGE}")
+        return
+
     async with ctx.typing():
         try:
-            data = await asyncio.to_thread(_create_scrabble_room, rules.lower())
+            data = await asyncio.to_thread(_create_scrabble_room, settings)
         except requests.Timeout:
             await ctx.reply("The Scrabble server didn't answer in time (it may be waking up). Try again in a minute.")
             return
@@ -1142,12 +1184,19 @@ async def scrabble_command(ctx, rules: str = "strict"):
             await ctx.reply(f"Couldn't create a Scrabble game: {e}"[:1900])
             return
 
+    mode = data.get("mode", settings.get("mode", "wild"))
+    length = data.get("length", settings.get("length", "full"))
+    timer = data.get("timer", settings.get("timer", "off"))
     link = SCRABBLE_BASE_URL + data["path"]
     await ctx.send(
-        f"🔤 **Scrabble game created** (rules: `{data.get('rules', rules)}`, room `{data['code']}`)\n"
+        f"🔤 **Scrabble game created** (room `{data['code']}`)\n"
+        f"Mode: **{mode.title()}** · Length: **{length.title()}** ({SCRABBLE_LENGTHS.get(length, '?')} tiles) · "
+        f"Timer: **{'none' if timer == 'off' else timer + ' per turn'}**\n"
         f"Join here: {link}\n"
-        f"Share the link with your opponent; the game starts when the second player joins."
+        f"Share the link with your opponent; the game starts when the second player joins. "
+        f"Either of you can still change the settings in the room before the first turn."
     )
+
 
 # --- Run the Bot ---
 if __name__ == "__main__":
