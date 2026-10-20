@@ -1109,6 +1109,43 @@ profiler.register_commands(
     allowed_guilds=getattr(botkey, "ALLOWED_GUILD_ID", None),   # same restriction as !ask
 )
 
+# --- Scrabble ---
+# Base URL of the deployed game. Override with scrabble_url in botkey.py if it ever changes.
+SCRABBLE_BASE_URL = getattr(botkey, "scrabble_url", "https://scrabble-0ae5.onrender.com").rstrip("/")
+
+
+def _create_scrabble_room(rules: str) -> dict:
+    """Blocking call, run in a thread. Returns the server's JSON ({code, path, url, rules})."""
+    # Long timeout: Render's free tier sleeps when idle and a cold start can take ~30-60 s.
+    r = requests.post(f"{SCRABBLE_BASE_URL}/create", json={"rules": rules}, timeout=90)
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if r.status_code != 201:
+        raise RuntimeError(data.get("error") or f"Scrabble server returned HTTP {r.status_code}")
+    return data
+
+
+@bot.command(name="scrabble", help="Creates a multiplayer Scrabble game and posts the link. Usage: !scrabble [rules]")
+@commands.cooldown(1, 30, commands.BucketType.user)
+async def scrabble_command(ctx, rules: str = "strict"):
+    async with ctx.typing():
+        try:
+            data = await asyncio.to_thread(_create_scrabble_room, rules.lower())
+        except requests.Timeout:
+            await ctx.reply("The Scrabble server didn't answer in time (it may be waking up). Try again in a minute.")
+            return
+        except Exception as e:
+            await ctx.reply(f"Couldn't create a Scrabble game: {e}"[:1900])
+            return
+
+    link = SCRABBLE_BASE_URL + data["path"]
+    await ctx.send(
+        f"🔤 **Scrabble game created** (rules: `{data.get('rules', rules)}`, room `{data['code']}`)\n"
+        f"Join here: {link}\n"
+        f"Share the link with your opponent; the game starts when the second player joins."
+    )
 
 # --- Run the Bot ---
 if __name__ == "__main__":
