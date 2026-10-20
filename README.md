@@ -76,3 +76,5 @@ poetry run python risubot.py
 ```
 
 Your bot should now be up and running!
+
+Yippee
