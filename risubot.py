@@ -480,14 +480,16 @@ async def collect_attachments(message) -> tuple[list, list]:
         ctype = (a.content_type or "").split(";")[0]
         if not ctype:
             ctype = mimetypes.guess_type(a.filename)[0] or ""
-        if not ctype.startswith(llmclient.SUPPORTED_PREFIXES):
+        # Images/audio/video/PDF, plus text and source-code files (.py, .js, .json, .md ...),
+        # which llmclient pastes into the prompt.
+        if not llmclient.is_supported_file(a.filename, ctype, a.size):
             skipped.append(a.filename)
             continue
         if total + a.size > MAX_ATTACHMENT_BYTES:
             skipped.append(a.filename)
             continue
         data = await a.read()
-        out.append(llmclient.Attachment(data, ctype, a.filename))
+        out.append(llmclient.Attachment.from_bytes(data, a.filename, ctype))
         total += a.size
 
     return out, skipped
@@ -496,7 +498,7 @@ async def collect_attachments(message) -> tuple[list, list]:
 @bot.command(name="ask")
 async def ask_command(ctx, *, prompt: str = ""):
     """Usage: !ask <question>, optionally with an image/audio/video/PDF
-    attached, or as a reply to a message that has one."""
+    or a text/code file attached, or as a reply to a message that has one."""
     allowed_id = getattr(botkey, "ALLOWED_GUILD_ID", None)
 
     if allowed_id is not None and ctx.guild.id not in allowed_id:

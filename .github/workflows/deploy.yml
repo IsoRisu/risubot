@@ -1,0 +1,22 @@
+name: Deploy to Laptop
+on:
+  push:
+    branches: [ main ]   # Adjust to your actual branch name, e.g., master
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, risubot-laptop]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pull latest code
+        run: |
+          cd ~/Yliopisto/risubot   # Your actual project path
+          git pull origin main
+
+      - name: Restart service
+        run: |
+          sudo systemctl restart risubot.service
+          sleep 2
+          systemctl is-active risubot.service
