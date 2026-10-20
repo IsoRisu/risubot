@@ -4,15 +4,9 @@
 # Providers (all optional except that at least one must be configured):
 #   gemini      Google Gemini (native API, the only one that takes audio/video/PDF)
 #   groq        Groq            fast, generous daily limits, has a vision model
-#   cerebras    Cerebras        very fast, ~1M tokens/day free
 #   mistral     Mistral AI      good multilingual quality, vision, ~1 request/s free
 #   nvidia      NVIDIA NIM      ~40 requests/min, big model catalogue (phone verification)
 #   openrouter  OpenRouter      many ":free" models (50 req/day, 1000/day after a one-off $10 top-up)
-#   cloudflare  Cloudflare Workers AI   10k "neurons"/day, needs an account id too
-#   sambanova   SambaNova       20 req/min but only ~20/day
-#   cohere      Cohere          Command A, strong multilingual, trial key: 20/min, 1000/month
-#   zai         Z.ai / Zhipu    GLM "Flash" models are free (1 concurrent request), has a vision model
-#   llm7        LLM7.io         no signup needed (opt-in, see below)
 #
 # Every provider is only used if its key is present in botkey.py. Order matters:
 # the first provider that answers wins, the rest are fallbacks.
@@ -24,13 +18,13 @@
 # every provider, keys from DIFFERENT accounts/projects are what gives extra quota.
 #
 #   GEMINI_API_KEY      = ["AIza...", "AIza..."]     # https://aistudio.google.com/apikey
-#   GROQ_API_KEY        = "gsk_..."                  # https://console.groq.com/keys 
+#   GROQ_API_KEY        = "gsk_..."                  # https://console.groq.com/keys
 #   MISTRAL_API_KEY     = "..."                      # https://console.mistral.ai/api-keys  (free "Experiment" plan)
 #   NVIDIA_API_KEY      = "nvapi-..."                # https://build.nvidia.com  (profile -> API keys)
 #   OPENROUTER_API_KEY  = "sk-or-..."                # https://openrouter.ai/keys
 # Optional tuning (all have defaults):
 #
-#   PROVIDER_ORDER   = ["groq", "gemini", "cerebras"]   # order AND whitelist; names as in the list above
+#   PROVIDER_ORDER   = ["groq", "gemini", "mistral"]   # order AND whitelist; names as in the list above
 #                                                      # (a comma separated string also works)
 #   ROTATE_PROVIDERS = True     # start each request on the next provider instead of always the first,
 #                               # which spreads usage so no single free tier is drained first
@@ -58,6 +52,10 @@
 #   LLMBlocked      / GeminiBlocked       the model refused (safety / policy)
 #   LLMKeysRejected / GeminiKeysRejected  every key of every provider is invalid
 #   ValueError                            unsupported attachment, or no configured provider can take it
+#
+# Text / source-code attachments (.py .js .json .md .txt ...) work with every provider: ask()
+# pastes their content into the prompt. In the bot, use is_supported_file(name, content_type, size)
+# to decide whether to download an attachment, and Attachment.from_bytes(data, filename) to wrap it.
 #   RuntimeError                          every provider rejected the request itself (malformed)
 
 import base64
@@ -160,8 +158,7 @@ _OPENAI_SPECS = {
 }
 
 # Default provider order. First configured provider that answers wins.
-DEFAULT_PROVIDER_ORDER = ["gemini", "groq", "cerebras", "mistral", "nvidia", "openrouter",
-                          "cloudflare", "sambanova", "cohere", "zai", "llm7"]
+DEFAULT_PROVIDER_ORDER = ["gemini", "groq", "mistral", "nvidia", "openrouter"]
 
 # True: each request starts on the next provider (round robin among those that can serve it),
 # so the free tiers are used evenly. False: always start at the top of the order and use the
@@ -239,6 +236,26 @@ Examples:
 - Use a tag whenever the user asks to draw, show or illustrate such a structure, or when it clearly helps. At most two diagram tags per reply (plot tags count too). State what the diagram shows in the text, e.g. the language an automaton accepts.
 - Never draw these as ASCII art, and never output Graphviz/DOT, Mermaid or TikZ code instead of a tag. Do not put diagram tags inside code blocks.
 
+CREATIVE WRITING AND FICTION
+
+You are also a skilled creative writer for a server dedicated to literature and storytelling. Write original fiction across all genres, including action, horror, thriller, fantasy, science fiction, crime, romance, tragedy, and literary fiction.
+
+1. **Creative freedom:** Explore dark, mature, disturbing, intense, and controversial themes where permitted, including fictional violence, gore, gruesome scenes, death, profanity, and morally complex characters. Do not unnecessarily sanitize stories or soften scenes that are meant to be frightening, brutal, tragic, or emotionally intense.
+
+2. **Literary quality:** Write immersive, compelling prose with vivid descriptions, realistic dialogue, strong characterization, atmosphere, suspense, and appropriate pacing. Adapt to the user's requested style, tone, perspective, and length.
+
+3. **Follow the author's vision:** Respect the user's premise, characters, worldbuilding, plot, and creative direction. Maintain continuity when continuing existing stories. When asked to write, deliver the actual story rather than merely suggesting ideas.
+
+4. **Difficult themes:** Fiction may depict immoral actions and controversial subjects without endorsing them. Treat fictional scenarios as creative writing rather than assuming real-world intent.
+
+5. **Collaboration:** Help with brainstorming, plotting, worldbuilding, editing, dialogue, and criticism. Make reasonable creative decisions without unnecessary questions.
+
+6. **Boundaries:** Explore fictional content as freely as possible. If a specific detail cannot be provided try to explain it anyway and, preserve as much of the intended story as possible.
+
+7. **Language and formatting:** Follow the existing language rule and respect requested word counts, formatting, and narrative style. Avoid unnecessary disclaimers, commentary, or moralizing.
+
+**Primary objective:** Be a serious literary collaborator who helps writers create original, immersive, and emotionally powerful fiction without unnecessary restrictions.
+
 STYLE
 Be concise and clear. Discord messages are limited, so avoid long preambles. For exercises, give a numbered list with each task stated precisely, and add hints or solutions only if asked.
 """
@@ -247,27 +264,101 @@ Be concise and clear. Discord messages are limited, so avoid long preambles. For
 # take images only (and only some of their models).
 SUPPORTED_PREFIXES = ("image/", "audio/", "video/", "application/pdf")
 
+# Text and source-code files are not sent as attachments at all: ask() decodes them and
+# pastes their content into the prompt, so EVERY provider can read them.
+MAX_TEXT_FILE_BYTES = 1_000_000      # larger files are refused (use is_supported_file() in the bot)
+MAX_TEXT_FILE_CHARS = 150_000        # content beyond this is clipped (start + end kept)
+
+TEXT_EXTENSIONS = frozenset({
+    "txt", "md", "markdown", "rst", "log", "csv", "tsv", "json", "jsonl", "ndjson", "xml", "yaml", "yml",
+    "toml", "ini", "cfg", "conf", "properties", "env", "gitignore", "lock", "tex", "bib", "srt", "vtt",
+    "py", "pyw", "pyi", "ipynb", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "html", "htm",
+    "css", "scss", "sass", "less", "java", "kt", "kts", "scala", "groovy", "gradle", "c", "h", "cc", "cpp",
+    "cxx", "hpp", "hh", "cs", "go", "rs", "rb", "php", "swift", "m", "mm", "dart", "lua", "pl", "pm", "r",
+    "jl", "hs", "ml", "clj", "ex", "exs", "erl", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "sql",
+    "graphql", "proto", "tf", "asm", "s", "v", "vhd", "vhdl", "cmake", "mk", "diff", "patch",
+})
+TEXT_FILENAMES = frozenset({"dockerfile", "makefile", "readme", "license", "gemfile", "rakefile",
+                            "procfile", "requirements.txt", ".gitignore", ".env.example"})
+_TEXT_MIMES = frozenset({
+    "application/json", "application/xml", "application/javascript", "application/x-javascript",
+    "application/typescript", "application/x-sh", "application/x-python-code", "application/x-yaml",
+    "application/yaml", "application/toml", "application/sql", "application/x-httpd-php",
+    "application/x-tex", "application/x-latex", "application/x-ipynb+json", "application/x-csh",
+})
+
+
+def _ext(filename: str) -> str:
+    name = os.path.basename(filename or "").lower()
+    return name.rsplit(".", 1)[-1] if "." in name else ""
+
+
+def is_text_filename(filename: str) -> bool:
+    """True for source code / plain-text files, judged by name only."""
+    name = os.path.basename(filename or "").lower()
+    return name in TEXT_FILENAMES or _ext(name) in TEXT_EXTENSIONS
+
+
+def _guess_mime(filename: str) -> str:
+    """MIME type for a filename. Source code is always text/plain, because mimetypes
+    returns None or odd values (application/x-sh, application/octet-stream ...) for it."""
+    if is_text_filename(filename):
+        return "text/plain"
+    mime_type, _ = mimetypes.guess_type(filename or "")
+    return mime_type or "application/octet-stream"
+
+
+def is_supported_file(filename: str, mime_type: str = None, size: int = None) -> bool:
+    """For the Discord bot: should this attachment be downloaded and passed to ask()?
+    Replaces checks like `content_type.startswith("image/")` and the size limit."""
+    mime_type = (mime_type or "").split(";")[0].strip().lower()
+    if is_text_filename(filename) or mime_type.startswith("text/") or mime_type in _TEXT_MIMES:
+        return size is None or size <= MAX_TEXT_FILE_BYTES
+    return mime_type.startswith(SUPPORTED_PREFIXES) or _guess_mime(filename).startswith(SUPPORTED_PREFIXES)
+
 
 class Attachment:
-    """One piece of non-text input: raw bytes plus its MIME type."""
+    """One piece of input: raw bytes plus its MIME type. Text/code files are allowed."""
 
     def __init__(self, data: bytes, mime_type: str, name: str = ""):
         self.data = data
-        self.mime_type = mime_type
+        self.mime_type = (mime_type or "application/octet-stream").split(";")[0].strip().lower()
         self.name = name
+        # Discord reports many code files as application/octet-stream or odd types:
+        # trust the filename when it says "source code".
+        if is_text_filename(name) and not self.mime_type.startswith(SUPPORTED_PREFIXES):
+            self.mime_type = "text/plain"
+
+    @property
+    def is_text(self) -> bool:
+        return self.mime_type.startswith("text/") or self.mime_type in _TEXT_MIMES
 
     @classmethod
     def from_path(cls, path: str) -> "Attachment":
-        mime_type, _ = mimetypes.guess_type(path)
-        if not mime_type:
-            raise ValueError(f"Could not guess a MIME type for {path!r}")
+        mime_type = _guess_mime(path)
         with open(path, "rb") as f:
             return cls(f.read(), mime_type, os.path.basename(path))
 
     @classmethod
-    def from_bytes(cls, data: bytes, filename: str) -> "Attachment":
-        mime_type, _ = mimetypes.guess_type(filename)
-        return cls(data, mime_type or "application/octet-stream", filename)
+    def from_bytes(cls, data: bytes, filename: str, mime_type: str = None) -> "Attachment":
+        return cls(data, mime_type or _guess_mime(filename), filename)
+
+    def decode_text(self) -> str:
+        """The file as text. Raises ValueError for binary data or oversized files."""
+        if len(self.data) > MAX_TEXT_FILE_BYTES:
+            raise ValueError(f"{self.name or 'file'} is too large ({len(self.data) // 1000} kB, "
+                             f"limit {MAX_TEXT_FILE_BYTES // 1000} kB).")
+        if b"\x00" in self.data[:8192]:
+            raise ValueError(f"{self.name or 'file'} looks like a binary file, not text.")
+        for enc in ("utf-8-sig", "utf-16") if self.data[:2] in (b"\xff\xfe", b"\xfe\xff") else ("utf-8-sig",):
+            try:
+                return self.data.decode(enc)
+            except UnicodeDecodeError:
+                pass
+        try:
+            return self.data.decode("cp1252")
+        except UnicodeDecodeError:
+            return self.data.decode("latin-1")
 
     def to_part(self) -> dict:
         """Gemini's inline_data part."""
@@ -284,6 +375,19 @@ class Attachment:
         return {"type": "image_url", "image_url": {"url": f"data:{self.mime_type};base64,{b64}"}}
 
 
+def _inline_text_files(prompt: str, text_files: list) -> str:
+    """Put the content of text/code attachments into the prompt, files first and the
+    user's own message LAST (when a prompt is too long, _clip keeps the end)."""
+    blocks = []
+    for a in text_files:
+        text = _clip(a.decode_text().replace("\r\n", "\n"), MAX_TEXT_FILE_CHARS)
+        blocks.append(f"=== BEGIN FILE: {a.name or 'file'} ===\n{text}\n=== END FILE: {a.name or 'file'} ===")
+    if not blocks:
+        return prompt
+    question = (prompt or "").strip() or "Review the attached file(s): explain what they do and point out any problems."
+    return "The user attached these file(s):\n\n" + "\n\n".join(blocks) + "\n\nUser's message:\n" + question
+
+
 def build_system_prompt(guild_context: str = None) -> str:
     """The base system prompt, plus optional per-guild context (e.g. recent chat
     history of that server). Nothing global is ever modified, so different
@@ -297,10 +401,16 @@ def build_system_prompt(guild_context: str = None) -> str:
 # Retry / rotation tuning
 # ---------------------------------------------------------------------------
 RETRY_STATUSES = {408, 425, 500, 502, 503, 504, 529}   # transient: retry on the same key
-ATTEMPTS_PER_KEY = 2                    # tries per key for transient errors
-REQUEST_TIMEOUT = 60                    # seconds for one HTTP request to Gemini (big media)
-OPENAI_REQUEST_TIMEOUT = 40             # ... and to every other provider
+ATTEMPTS_PER_KEY = 2                    # tries per key for transient HTTP errors
+REQUEST_TIMEOUT = 60                    # seconds for one HTTP request with media attached (Gemini)
+TEXT_REQUEST_TIMEOUT = 30               # seconds for one text/image request (any provider)
+OPENAI_REQUEST_TIMEOUT = 40             # hard ceiling for the OpenAI-compatible providers
 TOTAL_DEADLINE = 120                    # seconds for one whole ask(), all providers, models and keys
+
+# Fairness: one slow provider must not eat the whole TOTAL_DEADLINE.
+# Each provider gets max(MIN_PROVIDER_SLICE, remaining / providers_left) seconds.
+MIN_PROVIDER_SLICE = 15
+MAX_MODELS_PER_PROVIDER = 3             # after this many failed models, move on to the next provider
 
 DEFAULT_429_COOLDOWN = 30               # when the provider doesn't say how long to wait
 DAILY_FALLBACK_COOLDOWN = 3600          # daily quota hit but reset time unknown: re-check hourly
@@ -308,7 +418,8 @@ MAX_COOLDOWN = 24 * 3600
 DEAD_KEY_COOLDOWN = 3600                # invalid / revoked / out-of-credit key: re-check hourly
 FORBIDDEN_COOLDOWN = 600                # 403 that isn't clearly a dead key
 MODEL_MISSING_COOLDOWN = 6 * 3600       # 404: model id retired/unknown
-MODEL_OVERLOAD_COOLDOWN = 15            # model kept returning 5xx: try others first
+MODEL_OVERLOAD_COOLDOWN = 60            # model kept returning 5xx: try others first
+MODEL_TIMEOUT_COOLDOWN = 60             # model timed out: it is slow right now, try others first
 
 # True: start each request on the next key (spreads load, keeps every key under
 # its per-minute limit). False: stay on one key until it hits a limit.
@@ -318,7 +429,7 @@ BLOCK_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
                         "RECITATION", "IMAGE_SAFETY"}
 
 # Phrases that mark a 429 as "daily quota used up" for the non-Gemini providers.
-_DAILY_HINTS = ("per day", "daily", "neurons")
+_DAILY_HINTS = ("per day", "daily")
 
 
 class LLMUnavailable(RuntimeError):
@@ -366,6 +477,27 @@ def _clip(prompt: str, limit: int) -> str:
     head = int(limit * 0.6)
     tail = limit - head
     return prompt[:head] + "\n[... truncated ...]\n" + prompt[-tail:]
+
+
+MIN_USER_CHARS = 500  # smallest user-prompt budget worth sending to a too-small provider
+MARKER = "\n[... truncated ...]\n"
+
+
+def _clip_head(text: str, limit: int) -> str:
+    """Shorten a system prompt by keeping its start. Its opening rules and role
+    usually matter more than trailing examples, so the head is kept."""
+    if limit <= 0:
+        raise ValueError(f"clip limit must be positive, got {limit}")
+    if len(text) <= limit:
+        return text
+    if limit <= len(MARKER):
+        return text[:limit]
+    return text[:limit - len(MARKER)] + MARKER
+
+
+def _is_timeout(e: Exception) -> bool:
+    """Read/connect timeouts, bare or wrapped in URLError (socket.timeout is TimeoutError on 3.10+)."""
+    return isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +769,13 @@ class _Provider:
         base = [m for m in base if not self.pool.model_missing(m)]
         return [m for m in base if not self.pool.model_cooling(m)] + [m for m in base if self.pool.model_cooling(m)]
 
+    def timeout_for(self, attachments: list) -> float:
+        """Big media (audio/video/PDF) needs the long timeout; plain text and images don't.
+        A model that hasn't answered a text prompt in 30s is not going to."""
+        if any(not a.mime_type.startswith("image/") for a in attachments):
+            return self.request_timeout
+        return min(self.request_timeout, TEXT_REQUEST_TIMEOUT)
+
     # -- HTTP dialect (overridden) ----------------------------------------
     def url(self, model: str, idx: int) -> str:
         raise NotImplementedError
@@ -658,13 +797,16 @@ class _Provider:
     # -- one model, all keys ----------------------------------------------
     def call(self, prompt: str, attachments: list, model: str, system_prompt: str, deadline: float) -> str:
         """One model of this provider. Tries every key that isn't cooling down; rotates on
-        429 / rejected keys, retries transient errors on the same key with a short jittered
-        backoff.
+        429 / rejected keys, retries transient HTTP errors on the same key with a short
+        jittered backoff. A timeout is NOT retried: the model is slow, not the key.
+
+        `deadline` is this provider's slice, not the global deadline.
 
         Raises LLMUnavailable if no key could answer, LLMBlocked if the model refused the
         content."""
         label = f"{self.name}/{model}"
         body = self.build_body(model, prompt, attachments, system_prompt)
+        base_timeout = self.timeout_for(attachments)
 
         order, soonest = self.pool.plan(model)
         if not order:
@@ -680,7 +822,7 @@ class _Provider:
                 if remaining <= 1:
                     raise LLMUnavailable(f"{label}: out of time ({last_err})")
                 try:
-                    payload = self._post(model, idx, body, min(self.request_timeout, remaining))
+                    payload = self._post(model, idx, body, min(base_timeout, remaining))
                 except urllib.error.HTTPError as e:
                     text = e.read().decode("utf-8", "replace")[:2000]
                     last_err = f"key#{idx + 1} HTTP {e.code}: {_brief(text, 120)}"
@@ -695,6 +837,11 @@ class _Provider:
                 except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
                     # URLError/timeouts, connection reset mid-body, truncated or non-JSON body
                     last_err = f"key#{idx + 1} {type(e).__name__}: {_brief(str(e), 120)}"
+                    if _is_timeout(e):
+                        # Retrying (or rotating to another key of the same slow model) would just
+                        # burn another full timeout. Give the next model / provider the time.
+                        self.pool.cool_model(model, MODEL_TIMEOUT_COOLDOWN)
+                        raise LLMUnavailable(f"{label}: {last_err}")
                 else:
                     self.pool.stick(idx)
                     return self.parse(payload, model)
@@ -809,9 +956,9 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
 class _OpenAIProvider(_Provider):
-    """Any OpenAI-compatible /chat/completions endpoint."""
+    """Any OpenAI-compatible /chat/completions endpoint (Groq, Mistral, NVIDIA, OpenRouter)."""
 
-    def __init__(self, name, keys, models, vision_models, spec, accounts=None):
+    def __init__(self, name, keys, models, vision_models, spec):
         super().__init__(keys, models, vision_models)
         self.name = name
         self._url = spec["url"]
@@ -821,11 +968,8 @@ class _OpenAIProvider(_Provider):
         self.reset = spec.get("reset")
         self.extra_body = dict(spec.get("extra_body") or {})
         self.extra_headers = dict(spec.get("extra_headers") or {})
-        self.accounts = accounts or []       # per-key account ids (Cloudflare)
 
     def url(self, model, idx):
-        if self.accounts:
-            return self._url.format(account=self.accounts[idx])
         return self._url
 
     def headers(self, idx):
@@ -873,35 +1017,6 @@ class _OpenAIProvider(_Provider):
 # ---------------------------------------------------------------------------
 # Provider registry
 # ---------------------------------------------------------------------------
-def _cloudflare_pairs():
-    """[(token, account_id)], unique. CLOUDFLARE_ACCOUNT_ID is one id or a list aligned with the keys."""
-    keys = _as_list_keep(_cfg("CLOUDFLARE_API_KEY"))
-    ids = _as_list_keep(_cfg("CLOUDFLARE_ACCOUNT_ID"))
-    if not keys:
-        return []
-    if not ids:
-        log.warning("CLOUDFLARE_API_KEY is set but CLOUDFLARE_ACCOUNT_ID is missing; Cloudflare disabled")
-        return []
-    if len(ids) == 1:
-        ids = ids * len(keys)
-    if len(ids) != len(keys):
-        log.warning("CLOUDFLARE_ACCOUNT_ID must be one id or one per key; Cloudflare disabled")
-        return []
-    return list(dict.fromkeys(zip(keys, ids)))
-
-
-def _as_list_keep(value) -> list:
-    """Like _as_list but keeps duplicates and order (needed to align keys with account ids)."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        value = [value]
-    try:
-        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
-    except TypeError:
-        return []
-
-
 def _build_providers() -> list:
     built = {}
 
@@ -910,22 +1025,12 @@ def _build_providers() -> list:
         built["gemini"] = _GeminiProvider(gkeys, _models_cfg("GEMINI", "MODELS", MODEL_CHAIN))
 
     for name, spec in _OPENAI_SPECS.items():
-        accounts = None
-        if name == "cloudflare":
-            pairs = _cloudflare_pairs()
-            keys = [k for k, _ in pairs]
-            accounts = [a for _, a in pairs]
-        elif name == "llm7":
-            keys = _as_list(_cfg("LLM7_API_KEY"))
-            if not keys and _cfg("LLM7_ENABLED", False):
-                keys = ["unused"]              # LLM7 accepts any token when you have none
-        else:
-            keys = _as_list(_cfg(f"{name.upper()}_API_KEY"))
+        keys = _as_list(_cfg(f"{name.upper()}_API_KEY"))
         if not keys:
             continue
         models = _models_cfg(name, "MODELS", spec["models"])
         vision = _models_cfg(name, "VISION_MODELS", spec["vision"])
-        built[name] = _OpenAIProvider(name, keys, models, vision, spec, accounts)
+        built[name] = _OpenAIProvider(name, keys, models, vision, spec)
 
     order = _cfg("PROVIDER_ORDER") or DEFAULT_PROVIDER_ORDER
     if isinstance(order, str):
@@ -943,16 +1048,10 @@ def _build_providers() -> list:
     if not providers:
         raise RuntimeError(
             "No LLM provider is configured. Set at least one of GEMINI_API_KEY, GROQ_API_KEY, "
-            "CEREBRAS_API_KEY, MISTRAL_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY, "
-            "CLOUDFLARE_API_KEY (+ CLOUDFLARE_ACCOUNT_ID), SAMBANOVA_API_KEY, COHERE_API_KEY, "
-            "ZAI_API_KEY or LLM7_ENABLED in botkey.py")
+            "MISTRAL_API_KEY, NVIDIA_API_KEY or OPENROUTER_API_KEY in botkey.py")
 
     for p in providers:
         _ALL_KEYS.extend(k for k in p.keys if len(k) >= 8)
-    for p in providers:
-        for acct in getattr(p, "accounts", []):
-            if len(acct) >= 8:
-                _ALL_KEYS.append(acct)
     return providers
 
 
@@ -1006,21 +1105,46 @@ def _generate(prompt: str, attachments: list, system_prompt: str) -> str:
             shift = _rotate_cursor % len(fits)
             _rotate_cursor += 1
         fits = fits[shift:] + fits[:shift]
-    # Providers whose free tier is too small for this prompt come last, with the prompt clipped.
-    plan = [(p, False) for p in fits] + [(p, True) for p in too_big]
+    # Providers whose free tier is too small come last. Each entry carries a system-prompt
+    # limit: None sends the system prompt whole; a number clips only the system prompt,
+    # and only when it doesn't fit beside MIN_USER_CHARS of user prompt.
+    plan = [(p, None) for p in fits]
+    for p in too_big:
+        sys_limit = p.max_chars - MIN_USER_CHARS
+        if sys_limit <= 0:
+            continue  # this provider can't hold even a minimal user prompt
+        plan.append((p, sys_limit))
+    if not plan:
+        smallest = min(p.max_chars for p in capable)
+        raise ValueError(
+            f"The prompt is too large for every configured provider (smallest limit {smallest} chars, "
+            f"and at least {MIN_USER_CHARS} chars must remain for the question).")
 
     errors, waits, perms = [], [], []
-    for p, clip in plan:
-        if time.monotonic() >= deadline:
+    for n, (p, sys_limit) in enumerate(plan):
+        now = time.monotonic()
+        if now >= deadline:
             errors.append("deadline reached")
             perms.append(False)
             break
-        pr = _clip(prompt, p.max_chars - len(system_prompt)) if clip else prompt
+
+        # Fair share of what's left, so a hanging provider can't starve the ones after it.
+        # The last provider (or the only one, e.g. media -> Gemini) gets everything that remains.
+        left = len(plan) - n
+        slice_end = min(deadline, now + max(MIN_PROVIDER_SLICE, (deadline - now) / left))
+
+        if sys_limit is None:
+            sp, pr = system_prompt, prompt
+        else:
+            sp = _clip_head(system_prompt, sys_limit)
+            pr = _clip(prompt, p.max_chars - len(sp))
+        tried = 0
         for model in p.candidates(need_vision):
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= slice_end or tried >= MAX_MODELS_PER_PROVIDER:
                 break
+            tried += 1
             try:
-                text = p.call(pr, attachments, model, system_prompt, deadline)
+                text = p.call(pr, attachments, model, sp, slice_end)
             except LLMUnavailable as e:
                 errors.append(str(e))
                 perms.append(e.permanent)
@@ -1058,14 +1182,17 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     LLMKeysRejected (all keys invalid), ValueError (unsupported attachment) or
     RuntimeError (malformed request).
     """
-    attachments = attachments or []
+    attachments = list(attachments or [])
     system_prompt = build_system_prompt(guild_context)
 
+    text_files = [a for a in attachments if a.is_text]
+    attachments = [a for a in attachments if not a.is_text]
     for a in attachments:
         if not a.mime_type.startswith(SUPPORTED_PREFIXES):
-            raise ValueError(f"Unsupported attachment type: {a.mime_type}")
+            raise ValueError(f"Unsupported attachment type: {a.mime_type} ({a.name or 'unnamed'})")
 
-    prompt = _clip(prompt or "", MAX_PROMPT_CHARS)
+    prompt = _inline_text_files(prompt or "", text_files)
+    prompt = _clip(prompt, MAX_PROMPT_CHARS)
 
     try:
         return _generate(prompt, attachments, system_prompt)
