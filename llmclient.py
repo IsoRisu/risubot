@@ -30,6 +30,8 @@
 #                               # which spreads usage so no single free tier is drained first
 #   <NAME>_MODELS        = ["model-a", "model-b"]       # replace a provider's text-model list, e.g. GROQ_MODELS
 #   <NAME>_VISION_MODELS = ["model-v"]                  # replace a provider's image-capable model list
+#   LOCAL_MODEL          = "qwen2.5-coder:7b"           # optional local model for Ollama tool loops
+#   LOCAL_URL            = "http://localhost:11434/v1/chat/completions"
 #
 # Free-tier model names change often. If a model id stops existing the provider answers
 # 404 and the client skips it for a few hours, but update the lists below (or override
@@ -57,6 +59,7 @@
 # pastes their content into the prompt. In the bot, use is_supported_file(name, content_type, size)
 # to decide whether to download an attachment, and Attachment.from_bytes(data, filename) to wrap it.
 #   RuntimeError                          every provider rejected the request itself (malformed)
+from __future__ import annotations
 
 import base64
 import http.client
@@ -155,6 +158,11 @@ _OPENAI_SPECS = {
         max_chars=100_000, max_images=4, scope="key", reset="utc",
         extra_body={"max_tokens": 4096},
         extra_headers={"HTTP-Referer": "https://github.com/", "X-Title": "discord-bot"}),
+    "local": dict(
+        url="http://localhost:11434/v1/chat/completions",
+        models=["qwen3-4b-safe"],
+        vision=[],
+        max_chars=30_000, max_images=0, scope="model"),
 }
 
 # Default provider order. First configured provider that answers wins.
@@ -183,82 +191,53 @@ USER_AGENT = "Mozilla/5.0 (compatible; llmclient/2.0; +discord-bot)"   # some CD
 # Tells the model it is talking through Discord and exactly how math is shown.
 # Keep this in sync with latexrenderer.py: the "supported" list below is what
 # matplotlib's mathtext can actually draw (checked against matplotlib 3.10).
-SYSTEM_PROMPT = r"""You are a helpful assistant replying in a Discord chat. Reply in the same language the user writes in (Finnish if they write Finnish).
+SYSTEM_PROMPT = r"""You are a Discord chat assistant. Reply in the user's language (Finnish if they write Finnish). Be concise; no long preambles. For exercises: numbered list, tasks stated precisely, hints/solutions only if asked.
 
-HOW MATH IS DISPLAYED
-Discord cannot typeset LaTeX. A renderer on the bot turns math into images, but only math written inside delimiters:
-- Inline math: $...$   (use for short expressions inside a sentence)
-- Display math: $$...$$   (use for any longer, standalone, or important formula; put it on its own lines)
-Everything outside the delimiters is shown as ordinary Discord Markdown (**bold**, *italic*, numbered lists, short headings are all fine).
+MATH
+Discord can't render LaTeX; the bot renders only math inside delimiters: $...$ inline, $$...$$ display (own lines, for longer/important formulas). Everything else is Discord Markdown.
+Rules:
+1. All formulas, symbols, indexed/exponent variables, and numbers-with-math go in $...$ or $$...$$. Never bare LaTeX in text.
+2. Never put math in code blocks/backticks; code blocks are for real source code only.
+3. If the user asks for math "in LaTeX" (latex-muodossa), they want typeset, readable output, not source: use Markdown (numbered list, short intro) with $/$$ formulas. Never output \documentclass, \usepackage, \begin{document}, \section, \title, \maketitle, itemize/enumerate, or theorem environments. Only if explicitly asked for LaTeX source/.tex, give it in a ```latex block.
+4. Words inside math go in \text{...}, e.g. $x \ge 0 \text{ kun } n \to \infty$. Don't wrap whole sentences in $.
+5. $ is for math only. Write currency as "5 €" / "5 dollars".
+6. Multi-line derivations: ONE $$ block, rows separated by \\, & alignment allowed. No \begin{align}, \begin{equation}, \[ \] outside $$.
+7. Piecewise: \begin{cases} a & \text{if } x>0 \\ b & \text{otherwise} \end{cases} inside $$.
+8. Keep each $$ block to one idea, 1-4 rows; prefer several small blocks.
 
-RULES
-1. Every formula, symbol, variable with an index or exponent, and number-with-math goes inside $...$ or $$...$$. Never write bare LaTeX like \frac{1}{2} or x^2 in normal text.
-2. Never put math inside code blocks or backticks. Code blocks are only for real source code.
-3. When the user asks for math, exercises or formulas "in LaTeX" ("latex-muodossa"), they want them typeset and readable in the chat, NOT a LaTeX source file. Write normal Markdown (numbered list, short intro) with the formulas in $...$ / $$...$$. Never output \documentclass, \usepackage, \begin{document}, \section, \title, \maketitle, itemize/enumerate, or theorem environments. Only if the user explicitly asks for the LaTeX source code / a .tex file, give it inside a ```latex code block.
-4. Put words inside math in \text{...}, for example $x \ge 0 \text{ kun } n \to \infty$. Do not wrap whole sentences in $...$.
-5. Use $ only for math. Write currency as "5 €" or "5 dollars", never "$5".
-6. Multi-line derivations: ONE $$...$$ block, rows separated by \\ , alignment marks & are allowed. Do not use \begin{align}, \begin{equation} or \[ \] unless inside $$...$$.
-7. Piecewise functions: use \begin{cases} a & \text{if } x>0 \\ b & \text{otherwise} \end{cases} inside $$...$$.
-8. Keep each $$ block short (one idea, one to four rows). Prefer several small blocks over one huge one.
+SUPPORTED (others fail and show raw)
+\frac \sqrt[n] \binom \sum \prod \int \oint \lim \sup \inf \max \min \limsup \liminf \sin \cos \tan \arctan \ln \log \exp; Greek letters (\alpha \beta \gamma \delta \varepsilon \epsilon \theta \lambda \mu \pi \sigma \phi \varphi \omega \Delta \Omega ...); = \neq \le \ge \leq \geq < > \approx \sim \equiv \in \notin \subset \subseteq \supset \supseteq \mid \to \Rightarrow \Leftrightarrow \iff \implies \mapsto \forall \exists \neg \wedge \vee \cup \cap \setminus \emptyset \mathbb{R,N,Z,Q,C} \infty \partial \nabla \cdot \times \pm \ldots \cdots ^{} _{} |x| \|x\| \left( \right) \lfloor \rfloor \lceil \rceil \overline \hat \vec f'(x) \mathrm{d}x \mathbf \mathcal \text \, \quad
+NOT supported: matrix/pmatrix/bmatrix/array/tabular, \xrightarrow \underbrace \overbrace \boxed \cancel \color \tag \label \newcommand \usepackage, align outside $$, tikz, \displaystyle. For matrices, write rows as separate text lines.
 
-SUPPORTED MATH (use only these; unsupported commands fail and show as raw source)
-Fractions and roots: \frac{a}{b}, \sqrt{x}, \sqrt[n]{x}, \binom{n}{k}
-Big operators: \sum_{k=1}^{n}, \prod, \int_a^b, \oint, \lim_{x \to 0}, \sup, \inf, \max, \min, \limsup, \liminf
-Functions: \sin \cos \tan \arctan \ln \log \exp
-Greek letters: \alpha \beta \gamma \delta \varepsilon \epsilon \theta \lambda \mu \pi \sigma \phi \varphi \omega \Delta \Omega ...
-Relations: = \neq \le \ge \leq \geq < > \approx \sim \equiv \in \notin \subset \subseteq \supset \supseteq \mid \to \Rightarrow \Leftrightarrow \iff \implies \mapsto
-Logic and sets: \forall \exists \neg \wedge \vee \cup \cap \setminus \emptyset \mathbb{R} \mathbb{N} \mathbb{Z} \mathbb{Q} \mathbb{C}
-Other: \infty \partial \nabla \cdot \times \pm \ldots \cdots \to, ^{ } and _{ } for powers and indices, |x|, \|x\|, \left( \right), \lfloor \rfloor, \lceil \rceil, \overline{x}, \hat{x}, \vec{v}, f'(x), \mathrm{d}x, \mathbf{x}, \mathcal{F}, \text{...}, \, \quad
-DO NOT USE (not supported): \begin{matrix}/pmatrix/bmatrix/array/tabular, \xrightarrow, \underbrace, \overbrace, \boxed, \cancel, \color, \tag, \label, \newcommand, \usepackage, \begin{align} outside $$, tikz, \displaystyle. For a matrix, write its rows as separate lines of text instead.
+PLOTS
+You can't draw images; the bot draws from a tag on its own line: [[plot: f(x)]] or [[plot: f(x); g(x) from A to B]]
+- Plain calculator syntax, not LaTeX: x^2, 2*x+1, sin cos tan sqrt abs exp ln log10 pi e.
+- Function of x: just the expression, e.g. [[plot: x^2 - 2*x]] (or "y = ...").
+- Other curves: equation with a single "=", variables x,y only: [[plot: x^2 + y^2 = 1]], [[plot: x*y = 1]], [[plot: (x-1)^2 + (y+2)^2 = 9]].
+- Inequalities (shaded): use <, >, <=, >= (ASCII): [[plot: y > x^2]], [[plot: x + y <= 2; x > 0]]. Dashed boundary for < >, solid for <= >=; overlap of several is the solution. One comparison per inequality (a<x<b → x > a; x < b).
+- Up to 6 graphs separated by ;. "from A to B" optional, applies to both axes; function default is -10 to 10, so pick a range showing the interesting behavior, e.g. [[plot: sin(x); cos(x) from -6.3 to 6.3]]. Omit range for x-y curves (auto-fit).
+- Use when the user asks to draw/plot/sketch, or when it clearly helps (max two per reply). Also state the function in text as math, e.g. "Yksikköympyrä $x^2 + y^2 = 1$:" then the tag.
+- Never ASCII art; never tags inside code blocks.
 
-GRAPHS OF FUNCTIONS, CURVES AND REGIONS
-You cannot draw images, but the bot can draw graphs for you. Put a plot tag on its own line:
-[[plot: f(x)]]    or    [[plot: f(x); g(x) from A to B]]
-- Inside the tag use plain calculator syntax, NOT LaTeX: x^2, 2*x+1, sin(x), cos(x), tan(x), sqrt(x), abs(x), exp(x), ln(x), log10(x), pi, e.
-- Graph of a function of x: write just the expression, e.g. [[plot: x^2 - 2*x]] (or "y = x^2 - 2*x").
-- Curve that is not a function of x (circle, ellipse, hyperbola, any equation in x and y): write the equation with a single "=", e.g. [[plot: x^2 + y^2 = 1]], [[plot: x^2/4 + y^2 = 1]], [[plot: x*y = 1]], [[plot: (x-1)^2 + (y+2)^2 = 9]]. The variables are x and y only.
-- Inequality (shaded region): write it with <, >, <= or >= (ASCII, not ≤ ≥), e.g. [[plot: x^2 + y^2 < 1]], [[plot: y > x^2]], [[plot: x + y <= 2; x > 0]]. The boundary is drawn dashed for < and >, solid for <= and >=; with several inequalities the shaded regions overlap, and the darker overlap is the solution of the system. Use this when asked to illustrate the solution set of an inequality or system of inequalities. Only one comparison per inequality (no a < x < b; write it as two: x > a; x < b).
-- Separate up to 6 graphs with ;  The range "from A to B" is optional and applies to BOTH axes. For functions the default is -10 to 10, so choose a range that shows the interesting behaviour, e.g. [[plot: sin(x); cos(x) from -6.3 to 6.3]]. For curves in x and y, omit the range: the view fits automatically.
-- Use a tag whenever the user asks to draw, plot or sketch a function or curve, or when a graph clearly helps an explanation (at most two per reply). Also state the function or equation in the text as math, e.g. "Yksikköympyrä $x^2 + y^2 = 1$:" followed by [[plot: x^2 + y^2 = 1]].
-- Never draw graphs as ASCII art, and never put plot tags inside code blocks. (Function plots use [[plot: ...]]; the diagram tags below are for structures.)
-
-DIAGRAMS: GRAPHS, AUTOMATA, TURING MACHINES, TREES
-The bot can also draw graph-theory graphs, finite automata, Turing machines, pushdown automata and trees. Put a tag on its own line. The tag name is graph, tree, dfa, nfa, tm or pda; the content is a list of statements separated by newlines or ;
-- Edges: "A -- B" (undirected), "A -> B" (directed), "A <-> B" (both ways), "A -> B : 5" (label/weight). For automata put the label between the dashes: "q0 -a-> q1", "q0 -a,b-> q0" (a self-loop is fine). Turing machine rule "read/write,move": "q0 -1/0,R-> q1" (blank is _).
-- Other statements: "start: q0", "accept: q2, q3" (double circle), "nodes: x, y" (isolated nodes), "highlight: q1" (colours nodes, e.g. a path or the current state), "title: ...", "layout: circle|spring|lr|tb|tree" (optional; sensible default per tag).
-- Turing machine tape snapshot: "tape: 1 0 1 1 _", "head: 2" (0-based cell under the head), "state: q1".
-- Node names are single words (letters, digits, _): q0, q_accept, A, 3. Write epsilon as eps. No spaces inside names, no LaTeX, no $ in tags.
+DIAGRAMS
+Tags: graph, tree, dfa, nfa, tm, pda; content is statements separated by newlines or ;
+- Edges: "A -- B" undirected, "A -> B" directed, "A <-> B" both, "A -> B : 5" labeled/weighted. Automata: "q0 -a-> q1", "q0 -a,b-> q0" (self-loops ok). TM rule "read/write,move": "q0 -1/0,R-> q1" (blank is _).
+- Statements: "start: q0", "accept: q2, q3", "nodes: x, y", "highlight: q1", "title: ...", "layout: circle|spring|lr|tb|tree" (optional).
+- TM snapshot: "tape: 1 0 1 1 _", "head: 2" (0-based), "state: q1".
+- Node names: single words (letters, digits, _). Epsilon = eps. No spaces, LaTeX, or $ in tags.
 Examples:
 [[dfa: start: q0; accept: q1; q0 -0-> q0; q0 -1-> q1; q1 -0,1-> q1]]
 [[graph: A -- B : 3; B -- C : 1; A -- C : 7]]
 [[tree: root -> L; root -> R; L -> LL; L -> LR]]
 [[tm: start: q0; accept: qacc; q0 -1/1,R-> q0; q0 -_/_,L-> qacc]]
-- Use a tag whenever the user asks to draw, show or illustrate such a structure, or when it clearly helps. At most two diagram tags per reply (plot tags count too). State what the diagram shows in the text, e.g. the language an automaton accepts.
-- Never draw these as ASCII art, and never output Graphviz/DOT, Mermaid or TikZ code instead of a tag. Do not put diagram tags inside code blocks.
+- Use when asked to draw/show/illustrate such structures or when it clearly helps. Max two diagram tags per reply (plots count). State in text what the diagram shows (e.g. the accepted language).
+- Never ASCII art, Graphviz/DOT, Mermaid, or TikZ; no tags in code blocks.
 
-CREATIVE WRITING AND FICTION
-
-You are also a skilled creative writer for a server dedicated to literature and storytelling. Write original fiction across all genres, including action, horror, thriller, fantasy, science fiction, crime, romance, tragedy, and literary fiction.
-
-1. **Creative freedom:** Explore dark, mature, disturbing, intense, and controversial themes where permitted, including fictional violence, gore, gruesome scenes, death, profanity, and morally complex characters. Do not unnecessarily sanitize stories or soften scenes that are meant to be frightening, brutal, tragic, or emotionally intense.
-
-2. **Literary quality:** Write immersive, compelling prose with vivid descriptions, realistic dialogue, strong characterization, atmosphere, suspense, and appropriate pacing. Adapt to the user's requested style, tone, perspective, and length.
-
-3. **Follow the author's vision:** Respect the user's premise, characters, worldbuilding, plot, and creative direction. Maintain continuity when continuing existing stories. When asked to write, deliver the actual story rather than merely suggesting ideas.
-
-4. **Difficult themes:** Fiction may depict immoral actions and controversial subjects without endorsing them. Treat fictional scenarios as creative writing rather than assuming real-world intent.
-
-5. **Collaboration:** Help with brainstorming, plotting, worldbuilding, editing, dialogue, and criticism. Make reasonable creative decisions without unnecessary questions.
-
-6. **Boundaries:** Explore fictional content as freely as possible. If a specific detail cannot be provided try to explain it anyway and, preserve as much of the intended story as possible.
-
-7. **Language and formatting:** Follow the existing language rule and respect requested word counts, formatting, and narrative style. Avoid unnecessary disclaimers, commentary, or moralizing.
-
-**Primary objective:** Be a serious literary collaborator who helps writers create original, immersive, and emotionally powerful fiction without unnecessary restrictions.
-
-STYLE
-Be concise and clear. Discord messages are limited, so avoid long preambles. For exercises, give a numbered list with each task stated precisely, and add hints or solutions only if asked.
-"""
+CREATIVE WRITING
+You're also a skilled fiction writer for a literature/storytelling/roleplay server. Write original fiction in all genres.
+1. Explore dark, mature, intense themes where permitted: fictional violence, gore, death, profanity, morally complex characters. Don't sanitize scenes meant to be brutal, frightening, or tragic.
+2. Respect the author's premise, characters, worldbuilding, and direction; keep continuity. When asked to write, deliver the actual story, not just ideas.
+3. Follow the language rule and requested word counts/format/style. Avoid disclaimers, commentary, moralizing."""
 
 # Gemini accepts images, audio, video and PDF as inline data. The other providers
 # take images only (and only some of their models).
@@ -388,13 +367,14 @@ def _inline_text_files(prompt: str, text_files: list) -> str:
     return "The user attached these file(s):\n\n" + "\n\n".join(blocks) + "\n\nUser's message:\n" + question
 
 
-def build_system_prompt(guild_context: str = None) -> str:
-    """The base system prompt, plus optional per-guild context (e.g. recent chat
-    history of that server). Nothing global is ever modified, so different
-    guilds can't leak into each other."""
+def build_system_prompt(guild_context: str = None, system_prompt: str = None) -> str:
+    """The base system prompt (defaulting to SYSTEM_PROMPT or overridden by system_prompt),
+    plus optional per-guild context (e.g. recent chat history of that server).
+    Nothing global is ever modified, so different guilds can't leak into each other."""
+    base = SYSTEM_PROMPT if system_prompt is None else system_prompt
     if guild_context:
-        return SYSTEM_PROMPT + "\n\n" + guild_context
-    return SYSTEM_PROMPT
+        return base + "\n\n" + guild_context
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +715,7 @@ class _Provider:
     quota_scope = "model"        # what a 429 limits: "model" or "key"
     reset = None                 # "utc" | "pacific" | None
     request_timeout = OPENAI_REQUEST_TIMEOUT
+    text_timeout = TEXT_REQUEST_TIMEOUT
     max_chars = 100_000
     max_images = 0
 
@@ -928,8 +909,9 @@ class _GeminiProvider(_Provider):
         parts = [a.to_part() for a in attachments]
         if prompt:
             parts.append({"text": prompt})
+        sp = system_prompt if system_prompt is not None else SYSTEM_PROMPT
         return json.dumps({
-            "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
+            "systemInstruction": {"parts": [{"text": sp}]},
             "contents": [{"role": "user", "parts": parts}],
         }).encode("utf-8")
 
@@ -956,7 +938,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
 class _OpenAIProvider(_Provider):
-    """Any OpenAI-compatible /chat/completions endpoint (Groq, Mistral, NVIDIA, OpenRouter)."""
+    """Any OpenAI-compatible /chat/completions endpoint (Groq, Mistral, NVIDIA, OpenRouter, local)."""
 
     def __init__(self, name, keys, models, vision_models, spec):
         super().__init__(keys, models, vision_models)
@@ -984,10 +966,11 @@ class _OpenAIProvider(_Provider):
             content.append({"type": "text", "text": prompt or "Describe the image."})
         else:
             content = prompt or "(empty message)"     # plain string: the most widely accepted form
+        sp = system_prompt if system_prompt is not None else SYSTEM_PROMPT
         body = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
+                {"role": "system", "content": sp},
                 {"role": "user", "content": content},
             ],
         }
@@ -1025,6 +1008,8 @@ def _build_providers() -> list:
         built["gemini"] = _GeminiProvider(gkeys, _models_cfg("GEMINI", "MODELS", MODEL_CHAIN))
 
     for name, spec in _OPENAI_SPECS.items():
+        if name == "local":               # <-- never in the default fallback chain _providers
+            continue
         keys = _as_list(_cfg(f"{name.upper()}_API_KEY"))
         if not keys:
             continue
@@ -1059,6 +1044,36 @@ _providers = _build_providers()
 _rotate_lock = threading.Lock()
 _rotate_cursor = 0
 _tls = threading.local()
+
+_local_provider = None
+_local_provider_key = None
+
+
+def local_provider() -> _OpenAIProvider | None:
+    """The single local provider (Ollama / OpenAI-compatible endpoint) configured via
+    botkey.LOCAL_MODEL, or None if unconfigured. Cached across calls."""
+    global _local_provider, _local_provider_key
+    model = _cfg("LOCAL_MODEL") or _cfg("LOCAL_MODELS")
+    if not model:
+        _local_provider = None
+        _local_provider_key = None
+        return None
+    models = tuple(_as_list(model))
+    if not models:
+        _local_provider = None
+        _local_provider_key = None
+        return None
+    spec = dict(_OPENAI_SPECS.get("local", {}))
+    url = _cfg("LOCAL_URL") or spec.get("url", "http://localhost:11434/v1/chat/completions")
+    cache_key = (models, url)
+    if _local_provider is not None and _local_provider_key == cache_key:
+        return _local_provider
+    spec["url"] = url
+    spec["models"] = list(models)
+    keys = _as_list(_cfg("LOCAL_API_KEY")) or ["ollama"]
+    _local_provider = _OpenAIProvider("local", keys, list(models), [], spec)
+    _local_provider_key = cache_key
+    return _local_provider
 
 
 def providers_configured() -> list:
@@ -1165,7 +1180,7 @@ def _generate(prompt: str, attachments: list, system_prompt: str) -> str:
                          retry_after=min(waits) if waits else (min(soonest) if soonest else None))
 
 
-def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
+def ask(prompt: str, attachments=None, guild_context: str = None, system_prompt: str = None) -> str:
     """
     Send a prompt, optionally with attachments (list of Attachment), and
     return the reply as a string.
@@ -1174,6 +1189,7 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     model chain, rotating API keys on 429 / rejected keys. guild_context
     (optional) is extra text appended to the system prompt for this one call,
     used by the bot to give each Discord server its own memory.
+    system_prompt (optional) overrides SYSTEM_PROMPT.
 
     Images work with every provider that has a vision model; audio, video and
     PDF need Gemini. Which backend answered is available from last_backend().
@@ -1183,7 +1199,7 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     RuntimeError (malformed request).
     """
     attachments = list(attachments or [])
-    system_prompt = build_system_prompt(guild_context)
+    resolved_system_prompt = build_system_prompt(guild_context, system_prompt=system_prompt)
 
     text_files = [a for a in attachments if a.is_text]
     attachments = [a for a in attachments if not a.is_text]
@@ -1195,7 +1211,7 @@ def ask(prompt: str, attachments=None, guild_context: str = None) -> str:
     prompt = _clip(prompt, MAX_PROMPT_CHARS)
 
     try:
-        return _generate(prompt, attachments, system_prompt)
+        return _generate(prompt, attachments, resolved_system_prompt)
     except LLMUnavailable as e:
         # Full per-model detail is in the log; keep the chat message short.
         hint = f" Try again in about {int(e.retry_after) + 1} s." if e.retry_after else " Please try again in a minute."

@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 bk = types.ModuleType("botkey")
 bk.bot_key = "DISCORDSECRET.aaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -23,6 +24,7 @@ llmclient.VALIDATE_MODELS = False
 
 import aitools  # noqa: E402
 import githubclient as gh  # noqa: E402
+import llmbridge  # noqa: E402
 import llmtools  # noqa: E402
 import repoconfig as rc  # noqa: E402
 import repocmds  # noqa: E402
@@ -41,6 +43,12 @@ HIST = [
 
 def http_error(code, body='{"error":{"message":"quota"}}'):
     return urllib.error.HTTPError("http://x", code, "err", {}, io.BytesIO(body.encode()))
+
+
+def _pass_through_finalize():
+    """Stub the bridge's remote finalizer so job tests don't hit the network and don't
+    get the ⚠️ fallback marker prepended to the local text."""
+    return patch.object(llmbridge, "_default_remote_finalize", side_effect=lambda p, t, c: t)
 
 
 class BodyParseTests(unittest.TestCase):
@@ -193,19 +201,21 @@ class JobTests(unittest.TestCase):
             repocmds.parse_code_args("--branch ../x go")
 
     def test_job_pushes_files(self):
-        chat = scripted([T("", [dict(name="write_file", args={"path": "game/main.py", "content": "print('hi')"})]),
-                         T("Wrote the game.")])
-        client = FakeClient()
-        msg = asyncio.run(repocmds.sandbox_job("make a game", "demo", client=client, chat=chat))
-        self.assertEqual(client.pushed, ({"game/main.py": "print('hi')"}, "Sandbox output (1 file(s))", "demo"))
-        self.assertIn("commit/c1", msg)
-        self.assertIn("Wrote the game.", msg)
+        with _pass_through_finalize():
+            chat = scripted([T("", [dict(name="write_file", args={"path": "game/main.py", "content": "print('hi')"})]),
+                             T("Wrote the game.")])
+            client = FakeClient()
+            msg = asyncio.run(repocmds.sandbox_job("make a game", "demo", client=client, chat=chat))
+            self.assertEqual(client.pushed, ({"game/main.py": "print('hi')"}, "Sandbox output (1 file(s))", "demo"))
+            self.assertIn("commit/c1", msg)
+            self.assertIn("Wrote the game.", msg)
 
     def test_job_without_files_does_not_wipe(self):
-        client = FakeClient()
-        msg = asyncio.run(repocmds.sandbox_job("hi", None, client=client, chat=scripted([T("Hello!")])))
-        self.assertIsNone(client.pushed)
-        self.assertEqual(msg, "Hello!")
+        with _pass_through_finalize():
+            client = FakeClient()
+            msg = asyncio.run(repocmds.sandbox_job("hi", None, client=client, chat=scripted([T("Hello!")])))
+            self.assertIsNone(client.pushed)
+            self.assertEqual(msg, "Hello!")
 
     def test_end_to_end_with_run_task_error_has_retry(self):
         import repotask

@@ -21,6 +21,10 @@
 # (the loop takes far longer than Discord's 3 s) -> task lock -> [thread] view, tree, preload mentioned
 # files, tool loop -> post the answer with interaction.followup.send (chunked; falls back to a plain
 # channel message if the 15-minute interaction token has expired).
+#
+# The tool loop runs on the LOCAL Ollama model (llmtools.chat_tools_local); the final Discord
+# reply is written by a single remote call (llmbridge.run_bridged_loop). The chat= parameter is
+# still the test hook that fake tool turns are injected through (passed to the bridge as local_chat=).
 
 import asyncio
 import logging
@@ -35,6 +39,7 @@ from discord import app_commands
 
 import aitools
 import githubclient as gh
+import llmbridge
 import llmtools
 import repoconfig as rc
 import repotask
@@ -238,14 +243,18 @@ class TargetRun:
     published: Optional[Published] = None   # None: nothing was committed
 
 
-def run_target(spec, prompt: str, *, client, chat=llmtools.chat_tools, session_factory=aitools.ToolSession,
+def run_target(spec, prompt: str, *, client, chat=llmtools.chat_tools_local, session_factory=aitools.ToolSession,
                read_only: bool = True, branch: Optional[str] = None, iterate: bool = False,
                title: Optional[str] = None, body: Optional[str] = None) -> TargetRun:
     """Blocking (run it with asyncio.to_thread). Raises on any failure.
 
     iterate=True: the view comes from `branch` (already 'ai/'-prefixed) or else the newest bot branch, and
     new edits are committed on top of it. Otherwise the view is the base branch and write mode commits to
-    `branch` or a generated 'ai/...' name. read_only=True never commits."""
+    `branch` or a generated 'ai/...' name. read_only=True never commits.
+
+    `chat` is the test hook: passed to the bridge as local_chat= so tests can inject a scripted local
+    loop without touching Ollama. The finalize step (a single remote call for the Discord reply) is
+    not overridable here; call llmbridge.run_bridged_loop directly in tests that need to fake it."""
     ref, note = spec.base, ""
     if iterate:
         branch = branch or client.latest_bot_branch(spec.repo)
@@ -260,8 +269,8 @@ def run_target(spec, prompt: str, *, client, chat=llmtools.chat_tools, session_f
     system = aitools.build_tool_system_prompt("target", tree)
     session = session_factory("target", view)
     files = preload_files(session, prompt, tree)
-    result = toolloop.run_tool_loop(session, build_first_message(spec, prompt, files, read_only=read_only, note=note),
-                                    system, chat=chat)
+    result = llmbridge.run_bridged_loop(session, build_first_message(spec, prompt, files, read_only=read_only, note=note),
+                                        system, local_chat=chat)
     run = TargetRun(spec, session, result, files, read_only=read_only, branch=branch, iterated=iterate)
     if not read_only and session.changes():
         run.published = publish_changes(client, run, prompt, title, body)
@@ -306,7 +315,7 @@ def format_result(run: TargetRun) -> str:
     return text
 
 
-async def target_job(spec, prompt: str, *, client=None, chat=llmtools.chat_tools,
+async def target_job(spec, prompt: str, *, client=None, chat=llmtools.chat_tools_local,
                      session_factory=aitools.ToolSession, read_only: bool = True, branch: Optional[str] = None,
                      iterate: bool = False, title: Optional[str] = None, body: Optional[str] = None) -> str:
     """The work done while holding the task lock. Returns the message to post. Raises on any failure."""
@@ -410,7 +419,7 @@ async def sync_commands(bot, guild_ids: list) -> None:
                         type(e).__name__, e)
 
 
-def register(bot, *, client_factory=gh.GitHubClient, chat=llmtools.chat_tools,
+def register(bot, *, client_factory=gh.GitHubClient, chat=llmtools.chat_tools_local,
              session_factory=aitools.ToolSession, sync: bool = True):
     """Adds the /repo command group to bot.tree and (sync=True) syncs it on startup. Returns the group."""
     guild_ids = configured_guild_ids()

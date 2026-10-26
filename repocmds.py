@@ -8,6 +8,10 @@
 # Flow: authorize -> take the task lock -> tool loop (sandbox tools) -> if files were written:
 # force-push ONE orphan commit to the sandbox repo -> post the commit URL.
 # If the model wrote no files, nothing is pushed and its text reply is posted (the sandbox is not wiped).
+#
+# The tool loop runs on the LOCAL Ollama model (llmtools.chat_tools_local) and the final
+# Discord reply is written by a single remote call (llmbridge.run_bridged_loop). The chat=
+# parameter is still the test hook that fake tool turns are injected through.
 
 from __future__ import annotations
 
@@ -16,10 +20,11 @@ import re
 
 import aitools
 import githubclient as gh
+import llmbridge
+import llmtools
 import repoconfig as rc
 import repotask
 import toolloop
-import llmtools
 
 MAX_PROMPT_CHARS = 6_000            # user prompt + inlined text attachments
 MAX_ATTACH_FILES = 3
@@ -51,13 +56,17 @@ def format_success(commit: gh.CommitResult, files: list, reply: str) -> str:
 
 
 async def sandbox_job(prompt: str, branch: str | None, *, client: gh.GitHubClient | None = None,
-                      chat=llmtools.chat_tools) -> str:
-    """The work done while holding the lock. Returns the message to post. Raises on any failure."""
+                      chat=llmtools.chat_tools_local) -> str:
+    """The work done while holding the lock. Returns the message to post. Raises on any failure.
+
+    `chat` is the test hook: it is passed to the bridge as local_chat= so tests can inject
+    a scripted local loop without touching Ollama or the remote providers."""
     client = client or gh.GitHubClient()
 
     def blocking() -> str:
         session = aitools.ToolSession("sandbox")
-        result = toolloop.run_tool_loop(session, prompt, aitools.build_tool_system_prompt("sandbox"), chat=chat)
+        result = llmbridge.run_bridged_loop(session, prompt, aitools.build_tool_system_prompt("sandbox"),
+                                            local_chat=chat)
         files = session.changes()
         if not files:
             return result.text or "(The AI produced no files and no reply.)"
@@ -82,7 +91,7 @@ async def _attached_text(message) -> str:
     return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
-def register(bot, *, client_factory=gh.GitHubClient, chat=llmtools.chat_tools):
+def register(bot, *, client_factory=gh.GitHubClient, chat=llmtools.chat_tools_local):
     from discord.ext import commands
 
     @commands.guild_only()

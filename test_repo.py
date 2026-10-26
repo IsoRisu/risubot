@@ -10,6 +10,7 @@ import types
 import unittest
 import urllib.error
 from types import SimpleNamespace
+from unittest.mock import patch
 
 bk = types.ModuleType("botkey")
 bk.bot_key = "DISCORDSECRET.aaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -60,6 +61,7 @@ except ImportError:                     # minimal stand-in so repotarget imports
 import aitools  # noqa: E402
 import githubclient as gh  # noqa: E402
 import llmclient  # noqa: E402
+import llmbridge  # noqa: E402
 import llmtools  # noqa: E402
 import repocmds  # noqa: E402
 import repoconfig as rc  # noqa: E402
@@ -109,6 +111,13 @@ def scripted(turns):
 
 def T(text="", calls=()):
     return llmtools.ToolTurn(text, [dict(id=f"id{i}{len(text)}", _sig=None, **c) for i, c in enumerate(calls)], "fake/m")
+
+
+def _pass_through_finalize():
+    """Context manager: makes the bridge's remote finalizer a no-op that returns the local
+    model's text unchanged. The tests in this file exercise the tool loop and its side effects,
+    not the polish step, so they must not hit the network or trigger the ⚠️ fallback marker."""
+    return patch.object(llmbridge, "_default_remote_finalize", side_effect=lambda p, t, c: t)
 
 
 class FakeToolSession(aitools.ToolSession):
@@ -198,9 +207,12 @@ class FakeInteraction:
 
 
 def job(chat, client, prompt="add src/new.py", **kw):
+    """Run target_job with the remote finalizer stubbed out so the tests don't hit the network."""
     FakeToolSession.instances.clear()
     kw.setdefault("read_only", False)
-    return run(repotarget.target_job(SPEC, prompt, client=client, chat=chat, session_factory=FakeToolSession, **kw))
+    with _pass_through_finalize():
+        return run(repotarget.target_job(SPEC, prompt, client=client, chat=chat,
+                                         session_factory=FakeToolSession, **kw))
 
 
 # ---------------------------------------------------------------------------
@@ -341,16 +353,20 @@ class SandboxTests(unittest.TestCase):
             repocmds.parse_code_args("--branch ../x go")
 
     def test_job_pushes_files_but_empty_run_does_not_wipe(self):
-        chat = scripted([T("", [dict(name="write_file", args={"path": "game/main.py", "content": "print('hi')"})]),
-                         T("Wrote the game.")])
-        client = FakeClient()
-        msg = run(repocmds.sandbox_job("make a game", "demo", client=client, chat=chat))
-        self.assertEqual(client.pushed, ({"game/main.py": "print('hi')"}, "Sandbox output (1 file(s))", "demo"))
-        self.assertIn("commit/c1", msg)
-        self.assertIn("Wrote the game.", msg)
-        client = FakeClient()
-        self.assertEqual(run(repocmds.sandbox_job("hi", None, client=client, chat=scripted([T("Hello!")]))), "Hello!")
-        self.assertIsNone(client.pushed)
+        # The finalizer is stubbed out: these tests exercise the tool loop and the push,
+        # not the remote polish step. Without the stub the network failure would inject
+        # a ⚠️ marker and break the exact-equality assertion below.
+        with _pass_through_finalize():
+            chat = scripted([T("", [dict(name="write_file", args={"path": "game/main.py", "content": "print('hi')"})]),
+                             T("Wrote the game.")])
+            client = FakeClient()
+            msg = run(repocmds.sandbox_job("make a game", "demo", client=client, chat=chat))
+            self.assertEqual(client.pushed, ({"game/main.py": "print('hi')"}, "Sandbox output (1 file(s))", "demo"))
+            self.assertIn("commit/c1", msg)
+            self.assertIn("Wrote the game.", msg)
+            client = FakeClient()
+            self.assertEqual(run(repocmds.sandbox_job("hi", None, client=client, chat=scripted([T("Hello!")]))), "Hello!")
+            self.assertIsNone(client.pushed)
 
     def test_outage_error_has_retry_command(self):
         sent = []
@@ -496,7 +512,8 @@ class SlashTests(unittest.TestCase):
         args = {"repo": "me/app", "prompt": "add src/new.py", "base": None, "branch": None, "iter": False,
                 "title": None, "body": None, **args}
         FakeToolSession.instances.clear()
-        run(group.get_command("task").callback(it, **args))
+        with _pass_through_finalize():
+            run(group.get_command("task").callback(it, **args))
         return it
 
     def test_write_run_posts_pr_link(self):

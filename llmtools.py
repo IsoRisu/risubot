@@ -10,6 +10,9 @@
 #
 #   turn = chat_tools(history, tools_specs, system_prompt)   # blocking; -> ToolTurn(text, calls, backend)
 #   args is None when the model produced unparseable arguments (the loop reports that back to the model).
+#
+# chat_tools_local(history, tools_specs, system_prompt) is the same one model round, but restricted
+# to the SINGLE local Ollama provider (llmclient.local_provider()). Used by llmbridge for the tool loop.
 
 from __future__ import annotations
 
@@ -181,7 +184,7 @@ def _call_model(p, model: str, body: bytes, deadline: float) -> ToolTurn:
     order, soonest = p.pool.plan(model)
     if not order:
         raise llmclient.LLMUnavailable(f"{label}: every key is cooling down", retry_after=soonest)
-    timeout = min(p.request_timeout, llmclient.TEXT_REQUEST_TIMEOUT)
+    timeout = min(p.request_timeout, p.text_timeout)
     last = ""
     for idx in order:
         for attempt in range(1, llmclient.ATTEMPTS_PER_KEY + 1):
@@ -217,7 +220,7 @@ def _call_model(p, model: str, body: bytes, deadline: float) -> ToolTurn:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 def chat_tools(messages: list, tools: list, system_prompt: str) -> ToolTurn:
     """One model round. Walks providers (in llmclient order) and their models until one answers.
@@ -262,3 +265,31 @@ def chat_tools(messages: list, tools: list, system_prompt: str) -> ToolTurn:
     retry = min(waits) if waits else (min(soonest) if soonest else None)
     hint = f" Try again in about {int(retry) + 1} s." if retry else " Please try again in a minute."
     raise llmclient.LLMUnavailable("The AI is overloaded or out of quota right now." + hint, retry_after=retry)
+
+
+def chat_tools_local(messages: list, tools: list, system_prompt: str) -> ToolTurn:
+    """One tool round against the SINGLE local Ollama provider (llmclient.local_provider()).
+    Same return type and error semantics as chat_tools, but never falls back to a remote
+    provider: if the local model isn't configured or can't answer, the caller gets
+    llmclient.LLMUnavailable and llmbridge.run_bridged_loop surfaces it to the user.
+
+    raisies rc.LimitExceeded when the history is too big for the local model's ctx;
+    toolloop.compact_history() is what normally keeps it under the limit, so this is a
+    last-resort guard for callers that bypass compaction.
+    """
+    p = llmclient.local_provider()
+    if p is None:
+        raise llmclient.LLMUnavailable("Local model not configured (botkey.LOCAL_MODEL).")
+    size = history_chars(messages) + len(system_prompt) + len(json.dumps(tools))
+    if size > p.max_chars:
+        raise rc.LimitExceeded(
+            f"The task context grew too large ({size} chars) for the local model. Try a smaller request.")
+    candidates = p.candidates(False) or list(p.models)
+    if not candidates:
+        raise llmclient.LLMUnavailable("Local model not configured (no model id).")
+    model = candidates[0]
+    deadline = time.monotonic() + llmclient.TOTAL_DEADLINE
+    turn = _call_model(p, model, build_body(p, model, messages, tools, system_prompt), deadline)
+    llmclient._tls.backend = turn.backend
+    log.info("local tool round answered by %s", turn.backend)
+    return turn
