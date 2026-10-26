@@ -231,7 +231,7 @@ def chat_tools(messages: list, tools: list, system_prompt: str) -> ToolTurn:
     if not plan:
         raise rc.LimitExceeded(f"The task context grew too large ({size} chars) for the free AI providers. "
                                "Try a smaller request.")
-    deadline = time.monotonic() + llmclient.TOTAL_DEADLINE
+    deadline = time.monotonic() + p.total_deadline
     errors, waits, perms = [], [], []
     for n, p in enumerate(plan):
         now = time.monotonic()
