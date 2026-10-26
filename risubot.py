@@ -1218,6 +1218,12 @@ async def scrabble_command(ctx, *options: str):
         f"Either of you can still change the settings in the room before the first turn."
     )
 
+# --- GitHub / AI-coding commands: !code (sandbox) and /repo task (pull requests) ---
+import repocmds
+import repotarget
+repocmds.register(bot)
+repotarget.register(bot)
+
 # --- Run the Bot ---
 if __name__ == "__main__":
     if "--spotify-auth" in sys.argv:
