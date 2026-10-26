@@ -56,7 +56,7 @@ MAX_PATH_DEPTH = 12
 MAX_PR_TITLE_CHARS = 120
 MAX_PR_BODY_CHARS = 4_000
 MAX_COMMIT_MSG_CHARS = 200
-MAX_TASK_SECONDS = 600             # a lock older than this is treated as stale (hung task)
+MAX_TASK_SECONDS = 3600            # a lock older than this is treated as stale (hung task)
 HTTP_TIMEOUT = (10, 30)            # (connect, read) seconds for GitHub requests
 DISCORD_MSG_LIMIT = 1900
 

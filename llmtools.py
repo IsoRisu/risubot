@@ -105,6 +105,8 @@ def _gemini_contents(messages: list, model: str) -> list:
 
 
 def build_body(p, model: str, messages: list, tools: list, system_prompt: str) -> bytes:
+    if "qwen3" in model.lower() and "/no_think" not in system_prompt:
+        system_prompt += "\n/no_think"        # Qwen3 soft switch: skip the slow thinking phase
     if isinstance(p, llmclient._GeminiProvider):
         body = {"systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": _gemini_contents(messages, model),
@@ -231,7 +233,7 @@ def chat_tools(messages: list, tools: list, system_prompt: str) -> ToolTurn:
     if not plan:
         raise rc.LimitExceeded(f"The task context grew too large ({size} chars) for the free AI providers. "
                                "Try a smaller request.")
-    deadline = time.monotonic() + p.total_deadline
+    deadline = time.monotonic() + max(p.total_deadline for p in plan)
     errors, waits, perms = [], [], []
     for n, p in enumerate(plan):
         now = time.monotonic()
@@ -288,7 +290,9 @@ def chat_tools_local(messages: list, tools: list, system_prompt: str) -> ToolTur
     if not candidates:
         raise llmclient.LLMUnavailable("Local model not configured (no model id).")
     model = candidates[0]
-    deadline = time.monotonic() + llmclient.TOTAL_DEADLINE
+    # The provider carries its own (long) deadline from botkey.LOCAL_DEADLINE. Using the global
+    # llmclient.TOTAL_DEADLINE (120 s) here capped every local round at 2 minutes -> "timed out".
+    deadline = time.monotonic() + p.total_deadline
     turn = _call_model(p, model, build_body(p, model, messages, tools, system_prompt), deadline)
     llmclient._tls.backend = turn.backend
     log.info("local tool round answered by %s", turn.backend)
