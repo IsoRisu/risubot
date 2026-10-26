@@ -39,7 +39,9 @@ work) without them:
 # Your Discord bot token (from the Discord Developer Portal)
 bot_key = "YOUR_DISCORD_BOT_TOKEN"
 
-# Your Google Gemini API key (https://aistudio.google.com/app/apikey)
+# Your Google Gemini API key (https://aistudio.google.com/app/apikey).
+# A list of several keys also works; other providers (GROQ_API_KEY, MISTRAL_API_KEY,
+# NVIDIA_API_KEY, OPENROUTER_API_KEY) are optional fallbacks, see the top of llmclient.py.
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 
 # The Discord server (guild) ID where AI commands are allowed.
@@ -47,16 +49,16 @@ GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 # and choose "Copy Server ID".
 ALLOWED_GUILD_ID = 123456789012345678
 
-spotify_client_id =
-spotify_client_secret = 
-
+# Optional, only for Spotify links (see step 3)
+spotify_client_id = "YOUR_SPOTIFY_CLIENT_ID"
+spotify_client_secret = "YOUR_SPOTIFY_CLIENT_SECRET"
 ```
 
 Notes:
 
 - `bot_key` is lowercase; `GEMINI_API_KEY` and `ALLOWED_GUILD_ID` are
   uppercase. Match the names exactly as used in the code.
-- `ALLOWED_GUILD_ID` must be an `int`, not a string.
+- `ALLOWED_GUILD_ID` must be an `int` (or a list of ints), not a string.
 - This file is gitignored and won't be included if you clone the repo,
   so every fresh clone needs its own copy.
 - To use spotify functionality you need to authenticate first
@@ -77,4 +79,10 @@ poetry run python risubot.py
 
 Your bot should now be up and running!
 
-Yippee
+## 5. Run the tests
+
+The repo/AI-coding tests are offline (no network, no real keys):
+
+```bash
+poetry run python -m unittest test_repo -v
+```

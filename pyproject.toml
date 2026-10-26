@@ -10,7 +10,6 @@ python = "^3.11"
 "discord.py" = {version = "^2.4.0", extras = ["voice"]}
 yt-dlp = "*"
 PyNaCl = "^1.5.0"
-freeflow-llm = "*"
 matplotlib = "^3.8"
 spotipy = "*"
 requests = "*"  # imported directly by risubot.py (Spotify embed fallback); was only present via spotipy

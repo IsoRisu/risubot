@@ -332,11 +332,6 @@ def classify_message(text: str, cfg: ProfileConfig) -> tuple[str, Optional[str]]
     return text[: cfg.max_chars_per_message], command
 
 
-def clean_message(text: str, cfg: ProfileConfig) -> str:
-    """Return the text worth profiling, or "" to drop the message."""
-    return classify_message(text, cfg)[0]
-
-
 # ---------- feature extraction ------------------------------------------------
 
 _WORD_RE = re.compile(r"[^\W\d_]+(?:['’\-][^\W\d_]+)*")
