@@ -54,7 +54,7 @@ log = logging.getLogger("repotarget")
 
 MAX_PROMPT_CHARS = 6_000            # the /repo task prompt (same limit as !code)
 MAX_PRELOAD_FILES = 3               # files pasted into the first message
-MAX_PRELOAD_CHARS = 16_000          # file content budget, all preloaded files together
+MAX_PRELOAD_CHARS = 5_000           # file content budget, all preloaded files together
 MAX_PRELOAD_TRIES = 8               # read attempts for path-like words in the prompt (misses are cheap but not free)
 MAX_REPLY_CHARS = 6_000             # the model's answer as shown in Discord (about 3-4 messages)
 DISCORD_CHUNK = 1_900               # Discord's cap is 2000; leave headroom

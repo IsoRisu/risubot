@@ -35,6 +35,26 @@ log = logging.getLogger("llmtools")
 GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
 
 
+LOCAL_SPEED_HINT = (
+    "\nSPEED: every round is slow on this machine, so use as few rounds as possible. Put independent tool calls "
+    "in ONE round. To add text to the end of an existing file (e.g. a README line) call write_file with "
+    "append=true directly; do not read the file first. Do not list files you already see in the tree. "
+    "When the edits succeeded, answer with one short sentence."
+)
+
+
+def slim_tools(tools: list) -> list:
+    """Same tools, but with parameter descriptions dropped and long tool descriptions cut to the first
+    sentence. Roughly halves the tool block, which the local model must re-read every round."""
+    out = []
+    for t in tools:
+        params = t.get("parameters") or {}
+        props = {k: {kk: vv for kk, vv in v.items() if kk != "description"} for k, v in (params.get("properties") or {}).items()}
+        desc = (t.get("description") or "").split(". ")[0].rstrip(".") + "."
+        out.append({**t, "description": desc, "parameters": {**params, "properties": props}})
+    return out
+
+
 @dataclass
 class ToolTurn:
     text: str
@@ -147,6 +167,10 @@ def parse_response(p, payload: dict, model: str) -> ToolTurn:
             raise llmclient.LLMUnavailable(f"{backend}: empty response (finishReason={reason})")
         return ToolTurn(text, calls, backend)
 
+    usage = payload.get("usage") or {}
+    if usage:
+        log.info("%s usage: prompt_tokens=%s completion_tokens=%s", backend,
+                 usage.get("prompt_tokens"), usage.get("completion_tokens"))
     choices = payload.get("choices") or []
     if not choices:
         raise llmclient.LLMUnavailable(f"{backend}: no choices")
@@ -293,7 +317,10 @@ def chat_tools_local(messages: list, tools: list, system_prompt: str) -> ToolTur
     # The provider carries its own (long) deadline from botkey.LOCAL_DEADLINE. Using the global
     # llmclient.TOTAL_DEADLINE (120 s) here capped every local round at 2 minutes -> "timed out".
     deadline = time.monotonic() + p.total_deadline
-    turn = _call_model(p, model, build_body(p, model, messages, tools, system_prompt), deadline)
+    t0 = time.monotonic()
+    turn = _call_model(p, model, build_body(p, model, messages, slim_tools(tools), system_prompt + LOCAL_SPEED_HINT),
+                       deadline)
     llmclient._tls.backend = turn.backend
-    log.info("local tool round answered by %s", turn.backend)
+    log.info("local tool round answered by %s in %.0f s (history ~%d chars)", turn.backend,
+             time.monotonic() - t0, size)
     return turn
