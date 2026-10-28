@@ -92,3 +92,5 @@ chroma.sqlite3
 *.tmp
 *.bak
 *.old
+
+gemini_quota.json

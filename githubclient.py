@@ -412,7 +412,7 @@ class GitHubClient:
 
 # ---------------------------------------------------------------------------
 # RepoView: read-only, bound to one repo + ref, lazily lists the tree once.
-# aitools.ToolSession reads through this; nothing in it takes a repo/branch from the model.
+# the pipeline reads through this; nothing in it takes a repo/branch from the model.
 # ---------------------------------------------------------------------------
 class RepoView:
     def __init__(self, client: GitHubClient, repo: str, ref: str):

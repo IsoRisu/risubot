@@ -1,6 +1,7 @@
 # repoconfig.py
 # Config, auth, allowlists, limits, validators and the shared error types
 # for the repo/PR feature. Imports nothing from the rest of the bot except botkey.
+# The AI side of the feature is Gemini only; its keys/limits (GEMINI_LANES, REPO_LIMITS) are read by gemini_lanes.py.
 #
 # ---------------------------------------------------------------------------
 # botkey.py variables (all read lazily; a missing value never breaks bot start-up,
@@ -337,7 +338,7 @@ def sanitize_commit_message(msg: str | None, default: str = "AI-assisted changes
 # ---------------------------------------------------------------------------
 # Secrets: never written to GitHub, never echoed to chat
 # ---------------------------------------------------------------------------
-_SECRET_NAME_RE = re.compile(r"key|token|secret|passw|^pat$|_pat$", re.I)
+_SECRET_NAME_RE = re.compile(r"key|token|secret|passw|lanes|^pat$|_pat$", re.I)   # GEMINI_LANES holds API keys
 _SECRET_PATTERNS = (
     ("a GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}")),
     ("a Google API key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
@@ -350,15 +351,25 @@ _SECRET_PATTERNS = (
 )
 
 
+def _flatten_strings(v):
+    """Strings inside a str / list / tuple / set / dict of those, at any depth (GEMINI_LANES is a list of lists)."""
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from _flatten_strings(x)
+    elif isinstance(v, (list, tuple, set, frozenset)):
+        for x in v:
+            yield from _flatten_strings(x)
+
+
 @functools.lru_cache(maxsize=1)
 def secret_values() -> tuple:
     vals = set()
     for name in dir(botkey):
         if name.startswith("_") or not _SECRET_NAME_RE.search(name):
             continue
-        v = getattr(botkey, name, None)
-        items = [v] if isinstance(v, str) else list(v) if isinstance(v, (list, tuple, set)) else []
-        vals.update(s for s in items if isinstance(s, str) and len(s) >= 8)
+        vals.update(s for s in _flatten_strings(getattr(botkey, name, None)) if len(s) >= 8)
     return tuple(vals)
 
 

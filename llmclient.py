@@ -1,5 +1,6 @@
 # llmclient.py
-# Text-and-image in / text out, with automatic fallback across several free LLM APIs.
+# Text-and-image in / text out, with automatic fallback across several free LLM APIs (used by !ask and friends).
+# The repo/PR workflow does NOT use this module: it is Gemini-only (gemini_client.py + gemini_lanes.py).
 #
 # Providers (all optional except that at least one must be configured):
 #   gemini      Google Gemini (native API, the only one that takes audio/video/PDF)
@@ -30,12 +31,6 @@
 #                               # which spreads usage so no single free tier is drained first
 #   <NAME>_MODELS        = ["model-a", "model-b"]       # replace a provider's text-model list, e.g. GROQ_MODELS
 #   <NAME>_VISION_MODELS = ["model-v"]                  # replace a provider's image-capable model list
-#
-#   LOCAL_MODEL          = "qwen3-4b-safe"              # optional local model for Ollama tool loops
-#   LOCAL_URL            = "http://localhost:11434/v1/chat/completions"
-#   LOCAL_TIMEOUT        = 1800    # seconds per HTTP call to Ollama (a 4B on CPU is slow)
-#   LOCAL_DEADLINE       = 3600    # seconds per tool round (all retries included)
-#   LOCAL_MAX_CHARS      = 12000   # ~4096 ctx; raise together with num_ctx in the Modelfile
 #
 # Free-tier model names change often. If a model id stops existing the provider answers
 # 404 and the client skips it for a few hours, but update the lists below (or override
@@ -162,11 +157,6 @@ _OPENAI_SPECS = {
         max_chars=100_000, max_images=4, scope="key", reset="utc",
         extra_body={"max_tokens": 4096},
         extra_headers={"HTTP-Referer": "https://github.com/", "X-Title": "discord-bot"}),
-    "local": dict(
-        url="http://localhost:11434/v1/chat/completions",
-        models=["qwen3-4b-safe"],
-        vision=[],
-        max_chars=12_000, max_images=0, scope="model"),   # ~4096 ctx; raise together with num_ctx
 }
 
 # Default provider order. First configured provider that answers wins.
@@ -943,7 +933,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
 class _OpenAIProvider(_Provider):
-    """Any OpenAI-compatible /chat/completions endpoint (Groq, Mistral, NVIDIA, OpenRouter, local)."""
+    """Any OpenAI-compatible /chat/completions endpoint (Groq, Mistral, NVIDIA, OpenRouter)."""
 
     def __init__(self, name, keys, models, vision_models, spec):
         super().__init__(keys, models, vision_models)
@@ -1013,8 +1003,6 @@ def _build_providers() -> list:
         built["gemini"] = _GeminiProvider(gkeys, _models_cfg("GEMINI", "MODELS", MODEL_CHAIN))
 
     for name, spec in _OPENAI_SPECS.items():
-        if name == "local":               # <-- never in the default fallback chain _providers
-            continue
         keys = _as_list(_cfg(f"{name.upper()}_API_KEY"))
         if not keys:
             continue
@@ -1049,51 +1037,6 @@ _providers = _build_providers()
 _rotate_lock = threading.Lock()
 _rotate_cursor = 0
 _tls = threading.local()
-
-_local_provider = None
-_local_provider_key = None
-
-
-def local_provider() -> _OpenAIProvider | None:
-    """The single local provider (Ollama / OpenAI-compatible endpoint) configured via
-    botkey.LOCAL_MODEL, or None if unconfigured. Cached across calls.
-
-    The local model gets its own timeouts and prompt budget from botkey (LOCAL_TIMEOUT,
-    LOCAL_DEADLINE, LOCAL_MAX_CHARS). Without them it would inherit the remote defaults
-    (30 s HTTP / 120 s round / 30 000 chars), which a 4B model on CPU cannot meet."""
-    global _local_provider, _local_provider_key
-    model = _cfg("LOCAL_MODEL") or _cfg("LOCAL_MODELS")
-    if not model:
-        _local_provider = None
-        _local_provider_key = None
-        return None
-    models = tuple(_as_list(model))
-    if not models:
-        _local_provider = None
-        _local_provider_key = None
-        return None
-    spec = dict(_OPENAI_SPECS.get("local", {}))
-    url = _cfg("LOCAL_URL") or spec.get("url", "http://localhost:11434/v1/chat/completions")
-    timeout = int(_cfg("LOCAL_TIMEOUT") or 1800)     # per HTTP call
-    deadline = int(_cfg("LOCAL_DEADLINE") or 3600)   # per tool round
-    budget = int(_cfg("LOCAL_MAX_CHARS") or 12_000)  # prompt chars; keep in step with num_ctx
-    cache_key = (models, url, timeout, deadline, budget)
-    if _local_provider is not None and _local_provider_key == cache_key:
-        return _local_provider
-    spec["url"] = url
-    spec["models"] = list(models)
-    keys = _as_list(_cfg("LOCAL_API_KEY")) or ["ollama"]
-    p = _OpenAIProvider("local", keys, list(models), [], spec)
-    # The local model must be able to think as long as it needs. The defaults inherited
-    # from _OpenAIProvider are for cloud providers with sub-second first-token latency.
-    p.request_timeout = timeout
-    p.text_timeout = timeout
-    p.total_deadline = deadline
-    p.max_chars = budget
-    _local_provider = p
-    _local_provider_key = cache_key
-    return _local_provider
-
 
 def providers_configured() -> list:
     """Names of the active providers, in order."""

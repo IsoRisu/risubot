@@ -84,5 +84,13 @@ Your bot should now be up and running!
 The repo/AI-coding tests are offline (no network, no real keys):
 
 ```bash
-poetry run python -m unittest test_repo -v
+poetry run python -m unittest discover -v
 ```
+
+## 6. Repo / AI-coding commands (`!code`, `/repo`)
+
+These use Gemini only, through account "lanes" (see `botkey.example.py`) and need a GitHub token.
+Operator notes (adding lanes, daily counters, what to do when quota runs out): [README_REPO.md](README_REPO.md).
+
+The daily quota counters are saved in `gemini_quota.json` next to `risubot.py`. Add it to `.gitignore`,
+together with `botkey.py`.
